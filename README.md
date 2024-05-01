@@ -4,7 +4,7 @@ We introduce the concept of Hyper-Trees and offer a new direction in applying tr
 <img align="center" src="figures/hypertree.png">
 
 ## `News`
-:boom: [2024-05-01]
+:boom: [2024-05-01] Create repository and initial commits.
 
 ## `Feedback`
 We encourage you to provide feedback by opening a [new discussion](https://github.com/StatMixedML/Hyper-Trees/discussions).
