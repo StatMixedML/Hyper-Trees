@@ -9,7 +9,7 @@ We introduce the concept of Hyper-Trees and offer a new direction in applying tr
 This repo is still under construction. The source code of our Hyper-Tree architecture will be made available soon.
 
 ## `News`
-:boom: [2024-05-13] Added supplementary experiment outputs.
+:boom: [2024-05-13] Added supplementary experiment outputs. <br/>
 :boom: [2024-05-01] Create repository and initial commits.
 
 ## `Feedback`
