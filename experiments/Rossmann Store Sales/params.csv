@@ -1,0 +1,11 @@
+param,value
+eta,0.001
+linear_tree,True
+early_stopping,False
+num_boost_round,500
+stopping_rounds,10
+min_rounds,5
+feat_ts,"['day_of_week_feat_ts', 'day_of_month_feat_ts', 'month_feat_ts', 'quarter_feat_ts', 'promo', 'schoolholiday']"
+poly_degree,3
+use_time_idx,True
+model_type,Local
