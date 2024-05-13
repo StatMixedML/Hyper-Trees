@@ -6,7 +6,7 @@ We introduce the concept of Hyper-Trees and offer a new direction in applying tr
 </center>
 
 ## `General Information`
-This repo is still under construction. The source code of our Hyper-Tree architecture will be made available soon.
+This repo contains the official implementation of our paper [Forecasting with Hyper-Trees](). The source code of our Hyper-Tree architecture will be made available soon.
 
 ## `News`
 :boom: [2024-05-13] Added supplementary experiment outputs. <br/>
