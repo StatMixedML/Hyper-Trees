@@ -6,7 +6,7 @@ We introduce the concept of Hyper-Trees and offer a new direction in applying tr
 </center>
 
 ## `General Information`
-This repo contains the official implementation of our paper [Forecasting with Hyper-Trees](). The source code of our Hyper-Tree architecture will be made available soon.
+This repo contains the official implementation of our paper [Forecasting with Hyper-Trees](https://arxiv.org/abs/2405.07836). The source code of our Hyper-Tree architecture will be made available soon.
 
 ## `News`
 :boom: [2024-05-13] Added supplementary experiment outputs. <br/>
@@ -16,4 +16,6 @@ This repo contains the official implementation of our paper [Forecasting with Hy
 We encourage you to provide feedback by opening a [new discussion](https://github.com/StatMixedML/Hyper-Trees/discussions).
 
 ## `Reference Paper`
-[![Arxiv link](https://img.shields.io/badge/arXiv-Forecasting%20with%20Hyper--Trees-color=brightgreen)](https://arxiv.org/abs/2204.00778) <br/>
+[![Arxiv link](https://img.shields.io/badge/arXiv-Forecasting%20with%20Hyper--Trees-color=brightgreen)](https://arxiv.org/abs/2405.07836) <br/>
+
+
