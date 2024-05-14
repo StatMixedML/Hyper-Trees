@@ -1,12 +1,12 @@
 # Hyper-Trees
-We introduce the concept of Hyper-Trees and offer a new direction in applying tree-based models to time series data. Unlike conventional applications of decision trees that forecast time series directly, Hyper-Trees are designed to learn the parameters of a target time series model. Our framework leverages the gradient-based nature of boosted trees, which allows us to extend the concept of Hyper-Networks to Hyper-Trees and to induce a time-series inductive bias to tree models. By relating the parameters of a target time series model to features, Hyper-Trees address the challenge of parameter non-stationarity and enable tree-based forecasts to extend beyond their initial training range. With our research, we aim to explore the effectiveness of Hyper-Trees across various forecasting scenarios and to expand the application of gradient boosted decision trees past their conventional use in time series forecasting. 
+We introduce the concept of Hyper-Trees and offer a new direction in applying tree-based models to time series data. Unlike conventional applications of decision trees that forecast time series directly, Hyper-Trees are designed to learn the parameters of a target time series model. Our framework leverages the gradient-based nature of boosted trees, which allows us to extend the concept of Hyper-Networks to Hyper-Trees and to induce a time-series inductive bias to tree models. By relating the parameters of a target time series model to features, Hyper-Trees address the challenge of parameter non-stationarity and enables tree-based forecasts to extend beyond their initial training range. With our research, we aim to explore the effectiveness of Hyper-Trees across various forecasting scenarios and to expand the application of gradient boosted decision trees past their conventional use in time series forecasting. 
 
 <center>
     <img height="350" src="figures/hypertree.png">
 </center>
 
 ## `General Information`
-This repo contains the official implementation of our paper [Forecasting with Hyper-Trees](). The source code of our Hyper-Tree architecture will be made available soon.
+This repo contains the official implementation of our paper [Forecasting with Hyper-Trees](https://arxiv.org/abs/2405.07836). The source code of our Hyper-Tree architecture will be made available soon.
 
 ## `News`
 :boom: [2024-05-13] Added supplementary experiment outputs. <br/>
