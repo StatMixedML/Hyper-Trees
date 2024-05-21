@@ -16,4 +16,4 @@ This repo contains the official implementation of our paper [Forecasting with Hy
 We encourage you to provide feedback by opening a [new discussion](https://github.com/StatMixedML/Hyper-Trees/discussions).
 
 ## `Reference Paper`
-[![Arxiv link](https://img.shields.io/badge/arXiv-Forecasting%20with%20Hyper--Trees-color=brightgreen)](https://arxiv.org/abs/2405.07836) <br/>
+[![Arxiv link](https://img.shields.io/badge/arXiv-Forecasting%20with%20Hyper--Trees-color=brightgreen)](https://arxiv.org/pdf/2405.07836) <br/>
