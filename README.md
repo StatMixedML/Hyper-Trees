@@ -2,7 +2,7 @@
 We introduce the concept of Hyper-Trees and offer a new direction in applying tree-based models to time series data. Unlike conventional applications of decision trees that forecast time series directly, Hyper-Trees are designed to learn the parameters of time series models. Our framework combines the effectiveness of gradient boosted trees on tabular data with the advantages of established time series models, thereby naturally inducing a time series inductive bias to tree models. By relating the parameters of a target time series model to features, Hyper-Trees also address the issue of parameter non-stationarity. To resolve the inherent scaling issue of boosted trees when estimating a large number of target model parameters, we combine decision trees and neural networks within a unified framework. In this novel approach, the trees first generate informative representations from the input features, which a shallow network then maps to the target model parameters. With our research, we aim to explore the effectiveness of Hyper-Trees across various forecasting scenarios and to extend the application of gradient boosted trees outside their conventional use in time series modeling. 
 
 <div align="center">
-  <img src="figures/hypertree.png" width=70%>
+  <img src="figures/hypertree.png" width=90%>
 </div>
 
 ## `General Information`
