@@ -1,0 +1,16 @@
+This dataset comprises daily sales records from Walmart, the world’s largest retailer by
+revenue. It encompasses 3,049 products across multiple stores and states, resulting in 42,840
+distinct time series due to its multi-level hierarchical structure. We aggregate the data to the store-department level,
+yielding 70 daily time series. This aggregation is motivated primarily to reduce the intermittency present at the most granular
+level of the data. The data is borrowed from
+
+Makridakis, S., Spiliotis, E., & Assimakopoulos, V. (2022a). The m5 competition: Background,
+organization, and implementation. International Journal of Forecasting , 38 , 1325–1336.
+
+Makridakis, S., Spiliotis, E., Assimakopoulos, V., Chen, Z., Gaba, A., Tsetlin, I., & Winkler, R. L.
+(2022b). The m5 uncertainty competition: Results, findings and conclusions. International
+Journal of Forecasting , 38 , 1365–1385.
+
+Data can be found at:
+- https://github.com/Mcompetitions/M5-methods/tree/master
+- https://drive.google.com/drive/folders/1wxz-TAfVE7uKGCjh405eCb2Q_pG3kAm9

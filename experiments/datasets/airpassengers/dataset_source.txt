@@ -1,0 +1,7 @@
+This dataset contains the monthly totals of international airline passengers and is taken from
+
+Alexandrov, A., Benidis, K., Bohlke-Schneider, M., Flunkert, V., Gasthaus, J., Januschowski, T.,
+Maddix, D. C., Rangapuram, S., Salinas, D., Schulz, J., Stella, L., Türkmen, A. C., & Wang, Y.
+(2020). Gluonts: Probabilistic and neural time series modeling in python. Journal of Machine
+Learning Research, 21 , 1–6.
+https://github.com/awslabs/gluonts/tree/7bb6800a149a6caac7ec1725132c73bf06a57e2b

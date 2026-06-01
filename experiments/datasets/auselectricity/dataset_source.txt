@@ -1,0 +1,9 @@
+This dataset comprises five time series, each representing the electricity demand for five Australian states.
+Originally recorded at 30-minute intervals, we aggregate the data to a monthly time granularity for our analysis.
+This aggregation results in some months with incomplete data (when the original 30-minute observations do not span the entire month),
+which we exclude from the test set to ensure evaluation on complete months only. The dataset is borrowed from
+
+Godahewa, R., Bergmeir, C., Webb, G. I., Hyndman, R. J., & Montero-Manso, P. (2021b). Monash
+time series forecasting archive. In Neural Information Processing Systems Track on Datasets and
+Benchmarks .
+https://forecastingdata.org/

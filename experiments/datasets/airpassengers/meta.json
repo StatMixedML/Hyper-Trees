@@ -1,0 +1,35 @@
+{
+  "series_ids": [
+    "1"
+  ],
+  "n_series": 1,
+  "lags": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12
+  ],
+  "max_lag": 12,
+  "freq": "MS",
+  "fcst_h": 12,
+  "features": [
+    "month_feat_ts",
+    "quarter_feat_ts"
+  ],
+  "time_derived_feats": [
+  "month_feat_ts",
+  "quarter_feat_ts"
+],
+"dynamic_cov": [],
+"static_cov": [
+  "series_id_num"
+]
+}

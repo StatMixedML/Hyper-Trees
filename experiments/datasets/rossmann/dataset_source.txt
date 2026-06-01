@@ -1,0 +1,6 @@
+This dataset consists of a total of 1,115 daily series. We subset the data to include only stores that are open.
+The data is borrowed from
+
+Knauer, F., & Cukierski, W. (2015). Rossmann store sales.
+
+https://kaggle.com/competitions/rossmann-store-sales .

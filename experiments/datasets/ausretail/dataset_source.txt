@@ -1,0 +1,5 @@
+This dataset consists of a total of 133 monthly series and is borrowed from
+
+O’Hara-Wild, M., Hyndman, R., Wang, E., & Godahewa, R. (2022). tsibbledata: Diverse datasets
+for ’tsibble’.
+https://tsibbledata.tidyverts.org/reference/aus_retail.html

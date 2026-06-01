@@ -1,0 +1,108 @@
+[project]
+name = "hypertrees-forecasting"
+version = "0.1.0"
+description = "Forecasting with Hyper-Trees"
+readme = {file = "README.md", content-type = "text/markdown"}
+authors = [
+    {name = "Alexander März", email = "statmixedmlgit@gmail.com"},
+    {name = "Kashif Rasul", email = "rasul.kashif@morganstanley.com"}
+]
+maintainers = [
+    {name = "Alexander März", email = "statmixedmlgit@gmail.com"}
+]
+license = { file = "LICENSE" }
+requires-python = ">=3.11,<3.13"
+keywords = [
+    "Gradient Boosted Trees",
+    "Hyper Models",
+    "Hybrid Models",
+    "Machine Learning",
+    "Time Series Forecasting",
+    "Time-Varying Parameters"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: Other/Proprietary License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "lightgbm>=4.6",
+    "numpy>=2.0",
+    "pandas>=2.3",
+    "torch>=2,<2.10",
+]
+
+[project.optional-dependencies]
+extras = [
+    "matplotlib>=3.10",
+    "shap>=0.48,<0.51",
+    "optuna>=4",
+]
+
+docs = [
+    "mkdocs",
+    "mkdocstrings[python]",
+    "mkdocs-jupyter",
+    "mkdocs-material",
+]
+
+test = [
+    "pytest",
+    "pytest-cov",
+    "pytest-mock",
+    "coverage",
+    "flake8"
+]
+
+dev = [
+    "hypertrees-forecasting[test]",
+    "black",
+    "isort",
+    "mypy",
+    "pre-commit"
+]
+
+[project.urls]
+Repository = "https://github.com/StatMixedML/Hyper-Trees"
+Issues = "https://github.com/StatMixedML/Hyper-Trees/issues"
+Discussions = "https://github.com/StatMixedML/Hyper-Trees/discussions"
+Documentation = "https://github.com/StatMixedML/Hyper-Trees#readme"
+
+[tool.setuptools]
+include-package-data = true
+zip-safe = true
+
+[tool.setuptools.packages.find]
+include = ["hypertrees*"]
+exclude = ["docs*", "tests*", "*.tests*", "notebooks*", "scripts*", ".github*", "experiments*", "Examples*"]
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# restrict to models and utils
+addopts = "--cov=hypertrees.models --cov=hypertrees.utils --cov-report=term-missing"
+
+[tool.coverage.run]
+branch = true
+source = [
+    "hypertrees/models",
+    "hypertrees/utils.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+omit = [
+    "hypertrees/experiments/*",
+]
+
+[tool.coverage.html]
+directory = "htmlcov"

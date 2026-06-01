@@ -1,0 +1,10 @@
+This dataset comprises 1,428 monthly time series, belonging to six distinct domains: demographic, microeconomic,
+macroeconomic, industry, fi nance, and other categories, and is borrowed from
+
+Makridakis, S., & Hibon, M. (2000). The m3-competition: results, conclusions and implications.
+International Journal of Forecasting , 16 , 451–476.
+
+Godahewa, R., Bergmeir, C., Webb, G. I., Hyndman, R. J., & Montero-Manso, P. (2021b). Monash
+time series forecasting archive. In Neural Information Processing Systems Track on Datasets and
+Benchmarks.
+https://forecastingdata.org/
