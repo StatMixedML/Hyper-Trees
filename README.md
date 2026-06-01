@@ -142,10 +142,15 @@ If you use `Hyper-Trees` in your research, please cite our paper:
 [![Arxiv link](https://img.shields.io/badge/arXiv-Forecasting%20with%20Hyper--Trees-color=brightgreen)](https://arxiv.org/pdf/2405.07836) <br/>
 
 ```bibtex
-@article{maerz2024hypertrees,
+@article{maerz.2024,
   title   = {Forecasting with Hyper-Trees},
   author  = {März, Alexander and Rasul, Kashif},
   journal = {arXiv preprint arXiv:2405.07836},
   year    = {2024}
 }
 ```
+
+## `Star History`
+<a href="https://star-history.com/#StatMixedML/Hyper-Trees&Date">
+    <img src="https://api.star-history.com/svg?repos=StatMixedML/Hyper-Trees&type=Date" width="450">
+</a>
