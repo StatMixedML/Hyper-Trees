@@ -79,7 +79,7 @@ zip-safe = true
 
 [tool.setuptools.packages.find]
 include = ["hypertrees*"]
-exclude = ["docs*", "tests*", "*.tests*", "notebooks*", "scripts*", ".github*", "experiments*", "Examples*"]
+exclude = ["docs*", "tests*", "*.tests*", "notebooks*", "scripts*", ".github*", "experiments*", "examples*"]
 
 [build-system]
 requires = ["setuptools>=61", "wheel"]
