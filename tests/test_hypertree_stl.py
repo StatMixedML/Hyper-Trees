@@ -135,6 +135,37 @@ class TestHyperTreeSTLTraining:
                 lgb_params={}, train_data=sample_train_data, num_iterations=10, validation=False, early_stopping_round=5
             )
 
+    def test_train_type_validation(self, sample_train_data):
+        """Test training parameter type validation for seed, verbose, validation, deterministic."""
+        model = HyperTreeSTL()
+
+        with pytest.raises(TypeError, match="seed must be an integer"):
+            model.train(lgb_params={}, train_data=sample_train_data, num_iterations=10, seed="bad")
+
+        with pytest.raises(TypeError, match="verbose must be an integer"):
+            model.train(lgb_params={}, train_data=sample_train_data, num_iterations=10, verbose="bad")
+
+        with pytest.raises(TypeError, match="validation must be a boolean"):
+            model.train(lgb_params={}, train_data=sample_train_data, num_iterations=10, validation="yes")
+
+        with pytest.raises(TypeError, match="deterministic must be a boolean"):
+            model.train(lgb_params={}, train_data=sample_train_data, num_iterations=10, deterministic="yes")
+
+        with pytest.raises(ValueError, match="early_stopping_round must be a positive integer"):
+            model.train(lgb_params={}, train_data=sample_train_data, num_iterations=10, validation=True, early_stopping_round=-1)
+
+    def test_train_multi_series_raises(self):
+        """Test that multi-series data raises NotImplementedError."""
+        model = HyperTreeSTL()
+        df = pd.DataFrame({
+            'series_id': [0]*10 + [1]*10,
+            'date': list(pd.date_range('2020-01-01', periods=10, freq='MS')) * 2,
+            'value': np.random.randn(20),
+            'time': list(range(1, 11)) * 2,
+        })
+        with pytest.raises(RuntimeError, match="only supports univariate training"):
+            model.train(lgb_params={'learning_rate': 0.1}, train_data=df, num_iterations=10)
+
     def test_required_columns_validation(self):
         model = HyperTreeSTL()
 

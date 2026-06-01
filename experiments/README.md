@@ -6,6 +6,13 @@ This folder is the reproducibility section for the paper. It contains all data, 
 
 ## Installation
 
+First, clone the repository:
+
+```bash
+git clone https://github.com/StatMixedML/Hyper-Trees.git
+cd Hyper-Trees
+```
+
 We use [`uv`](https://docs.astral.sh/uv/) as the package manager. Install it first if you don't already have it:
 
 ```bash
@@ -14,7 +21,7 @@ pip install uv
 
 Our paper runs used **`uv 0.8.12`**. 
 
-In the project's top-level folder (the folder you cloned or extracted the project into, e.g., `Hyper_Trees/`), create a Python 3.11 venv and install the pinned experiments environment:
+In the project's top-level folder (the `Hyper-Trees/` folder you cloned into), create a Python 3.11 venv and install the pinned experiments environment:
 
 ```bash
 # Create a Python 3.11.0 venv (must be exactly 3.11.0 to match the pinned environment)

@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import torch
 from unittest.mock import Mock, patch
-from hypertrees.utils import TrainingResult, CustomLogger, TimeSeriesPreprocessor, prepare_datasets
+from hypertrees.utils import TrainingResult, CustomLogger, TimeSeriesPreprocessor, prepare_datasets, validate_series_order
 
 
 class TestTrainingResult:
@@ -354,3 +354,42 @@ class TestPrepareDatasets:
                         stopping_rounds=10,
                         verbose=False
                     )
+
+
+class TestValidateSeriesOrder:
+    """Test the validate_series_order function."""
+
+    def test_missing_columns(self):
+        """Test that missing required columns raises ValueError."""
+        data = pd.DataFrame({'value': [1, 2, 3]})
+        with pytest.raises(ValueError, match="requires both 'series_id' and 'date' columns"):
+            validate_series_order(data)
+
+    def test_non_contiguous_series(self):
+        """Test that non-contiguous series raises ValueError."""
+        data = pd.DataFrame({
+            'series_id': [0, 1, 0],
+            'date': pd.to_datetime(['2020-01-01', '2020-01-02', '2020-01-03']),
+            'value': [1, 2, 3]
+        })
+        with pytest.raises(ValueError, match="appear in multiple non-contiguous"):
+            validate_series_order(data)
+
+    def test_non_monotonic_dates(self):
+        """Test that non-monotonic dates within a series raises ValueError."""
+        data = pd.DataFrame({
+            'series_id': [0, 0, 0],
+            'date': pd.to_datetime(['2020-01-03', '2020-01-01', '2020-01-02']),
+            'value': [1, 2, 3]
+        })
+        with pytest.raises(ValueError, match="not strictly increasing"):
+            validate_series_order(data)
+
+    def test_valid_data_passes(self):
+        """Test that properly ordered data passes validation."""
+        data = pd.DataFrame({
+            'series_id': [0, 0, 1, 1],
+            'date': pd.to_datetime(['2020-01-01', '2020-01-02', '2020-01-01', '2020-01-02']),
+            'value': [1, 2, 3, 4]
+        })
+        validate_series_order(data)

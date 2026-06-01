@@ -84,6 +84,19 @@ class TestHyperTreeARInitialization:
         with pytest.warns(UserWarning, match="not nn.MSELoss"):
             HyperTreeAR(hessian_method="gn", loss_fn=nn.L1Loss())
 
+    def test_invalid_freq_type(self):
+        """Test that non-string freq raises TypeError."""
+        with pytest.raises(TypeError, match="freq must be a string"):
+            HyperTreeAR(freq=123)
+
+    def test_invalid_n_hessian_probes(self):
+        """Test that invalid n_hessian_probes raises ValueError."""
+        with pytest.raises(ValueError, match="n_hessian_probes must be a positive integer"):
+            HyperTreeAR(n_hessian_probes=0)
+
+        with pytest.raises(ValueError, match="n_hessian_probes must be a positive integer"):
+            HyperTreeAR(n_hessian_probes=-5)
+
 
 class TestHyperTreeARTraining:
     """Test HyperTreeAR training functionality."""
@@ -142,13 +155,32 @@ class TestHyperTreeARTraining:
         # Test early_stopping_round without validation
         with pytest.raises(ValueError, match="early_stopping_round can only be used when validation is True"):
             model.train(
-                lgb_params={}, 
-                train_data=sample_train_data, 
+                lgb_params={},
+                train_data=sample_train_data,
                 num_iterations=10,
                 validation=False,
                 early_stopping_round=5
             )
-    
+
+    def test_train_type_validation(self, sample_train_data):
+        """Test training parameter type validation for seed, verbose, validation, deterministic."""
+        model = HyperTreeAR()
+
+        with pytest.raises(TypeError, match="seed must be an integer"):
+            model.train(lgb_params={}, train_data=sample_train_data, num_iterations=10, seed="bad")
+
+        with pytest.raises(TypeError, match="verbose must be an integer"):
+            model.train(lgb_params={}, train_data=sample_train_data, num_iterations=10, verbose="bad")
+
+        with pytest.raises(TypeError, match="validation must be a boolean"):
+            model.train(lgb_params={}, train_data=sample_train_data, num_iterations=10, validation="yes")
+
+        with pytest.raises(TypeError, match="deterministic must be a boolean"):
+            model.train(lgb_params={}, train_data=sample_train_data, num_iterations=10, deterministic="yes")
+
+        with pytest.raises(ValueError, match="early_stopping_round must be a positive integer"):
+            model.train(lgb_params={}, train_data=sample_train_data, num_iterations=10, validation=True, early_stopping_round=-1)
+
     def test_required_columns_validation(self):
         """Test that missing required columns raise ValueError."""
         model = HyperTreeAR()
@@ -322,7 +354,38 @@ class TestHyperTreeARForecasting:
                 test_data=test_data,
                 type="invalid"
             )
-    
+
+    def test_forecast_series_mismatch(self, trained_model):
+        """Test that mismatched series IDs between train and test raises ValueError."""
+        # Extra series in test_data not in training
+        test_data = pd.DataFrame({
+            'series_id': [0]*3 + [1]*3 + [99]*3,
+            'date': pd.date_range('2020-02-01', periods=3, freq='MS').tolist() * 3,
+            'feature1': range(9), 'feature2': range(9)
+        })
+        with pytest.raises(ValueError, match="Missing series in training"):
+            trained_model.forecast(test_data=test_data)
+
+        # Missing series in test_data
+        test_data = pd.DataFrame({
+            'series_id': [0]*3 + [1]*3,
+            'date': pd.date_range('2020-02-01', periods=3, freq='MS').tolist() * 2,
+            'feature1': range(6), 'feature2': range(6)
+        })
+        with pytest.raises(ValueError, match="Extra series not in test_data"):
+            trained_model.forecast(test_data=test_data)
+
+    def test_forecast_wrong_row_count(self, trained_model):
+        """Test that wrong number of rows per series raises ValueError."""
+        test_data = pd.DataFrame({
+            'series_id': [0]*2 + [1]*3 + [2]*3,
+            'date': pd.date_range('2020-02-01', periods=2, freq='MS').tolist() +
+                    pd.date_range('2020-02-01', periods=3, freq='MS').tolist() * 2,
+            'feature1': range(8), 'feature2': range(8)
+        })
+        with pytest.raises(ValueError, match="Each series must have exactly fcst_h"):
+            trained_model.forecast(test_data=test_data)
+
     def test_forecast_success(self, trained_model, sample_train_data, sample_test_data):
         """Test successful forecasting."""
         result = trained_model.forecast(
