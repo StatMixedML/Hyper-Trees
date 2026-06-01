@@ -3,8 +3,8 @@
 |                      | **[Release Notes](https://github.com/StatMixedML/Hyper-Trees/releases)** |
 |----------------------|---|
 | **Open&#160;Source** | [![License: Apache 2.0 + Commons Clause](https://img.shields.io/badge/License-Apache_2.0_with_Commons_Clause-yellow.svg)](LICENSE) |
-| **CI/CD**            | [![github-actions](https://img.shields.io/github/actions/workflow/status/StatMixedML/Hyper-Trees/unit-tests.yml?logo=github)](https://github.com/StatMixedML/Hyper-Trees/actions/workflows/unit-tests.yml) |
-| **Code**             | [![!pypi](https://img.shields.io/pypi/v/hypertrees-forecasting?color=orange)](https://pypi.org/project/hypertrees-forecasting/) [![!python-versions](https://img.shields.io/pypi/pyversions/hypertrees-forecasting)](https://www.python.org/) <img src="https://codecov.io/gh/StatMixedML/Hyper-Trees/branch/main/graph/badge.svg" alt="Code coverage status badge"> |
+| **CI/CD**            | [![github-actions](https://img.shields.io/github/actions/workflow/status/StatMixedML/Hyper-Trees/unit-tests.yml?logo=github)](https://github.com/StatMixedML/Hyper-Trees/actions/workflows/unit-tests.yml) <img src="https://codecov.io/gh/StatMixedML/Hyper-Trees/branch/main/graph/badge.svg" alt="Code coverage status badge"> |
+| **Package**             | [![!pypi](https://img.shields.io/pypi/v/hypertrees-forecasting?color=orange)](https://pypi.org/project/hypertrees-forecasting/) [![!python-versions](https://img.shields.io/pypi/pyversions/hypertrees-forecasting)](https://www.python.org/) |
 | **Downloads**        | ![Pepy Total Downloads](https://img.shields.io/pepy/dt/hypertrees-forecasting?label=PyPI%20Downloads&color=green) |
 | **Paper**            | [![Arxiv link](https://img.shields.io/badge/arXiv-Forecasting%20with%20Hyper--Trees-color=brightgreen)](https://arxiv.org/pdf/2405.07836) |
 
