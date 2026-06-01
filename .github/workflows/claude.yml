@@ -6,7 +6,7 @@ on:
   pull_request_review_comment:
     types: [created]
   issues:
-    types: [opened, assigned]
+    types: [opened, assigned, labeled]
   pull_request_review:
     types: [submitted]
 
@@ -23,10 +23,11 @@ jobs:
       pull-requests: write
       issues: write
       id-token: write
-      actions: read # Required for Claude to read CI results on PRs
+      actions: read
+
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 1
 
@@ -36,12 +37,10 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
-          # Allow Claude to read CI results on PRs
           additional_permissions: |
             actions: read
 
-          # Optional: pass Claude Code CLI flags, for example pin a model or
-          # allow specific commands so Claude can run your tests or linters.
-          # claude_args: |
-          #   --model claude-sonnet-4-6
-          #   --allowedTools "Bash(uv run pytest),Bash(uv run ruff check)"
+          claude_args: |
+            --model claude-sonnet-4-6
+            --max-turns 10
+            --allowedTools "Edit,Read,Write,Bash(uv run pytest:*),Bash(uv run ruff check:*),Bash(gh:*),Bash(git:*)"
