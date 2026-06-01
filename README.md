@@ -150,7 +150,7 @@ If you use `Hyper-Trees` in your research, please cite our paper:
 }
 ```
 
-## `Star History`
+## History
 <a href="https://star-history.com/#StatMixedML/Hyper-Trees&Date">
     <img src="https://api.star-history.com/svg?repos=StatMixedML/Hyper-Trees&type=Date" width="450">
 </a>
