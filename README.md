@@ -33,7 +33,7 @@ Hyper-Trees offer several advantages:
 ---
 
 # News
-[2026-06-01] v0.1.0 released on [PyPI](https://pypi.org/project/hypertrees-forecasting/).
+[2026-06-01] v0.1.0 released on [PyPI](https://pypi.org/project/hypertrees-forecasting/).<br>
 [2024-05-01] Create repository and initial commits.
 
 ---
