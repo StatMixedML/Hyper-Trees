@@ -51,6 +51,8 @@ Hyper-Trees offer several advantages:
 `Global` means a single model is trained across multiple time series; `Local` means a separate model is trained for each individual series.
 All models currently provide point forecasts only. Probabilistic forecasting is planned for future releases. Note on `Hyper-Tree-STL`: it is designed to decompose time series into trend and seasonal components and is not intended for forecasting. However, the STL-parameters can still be used to generate forecasts.
 
+---
+
 # Getting Started
 
 The example below trains a `Hyper-Tree-AR` model on the classic AirPassengers series and forecasts the final 12 months. Your data only needs the columns `series_id`, `date`, and `value`. Any other columns are automatically treated as features, and the autoregressive lags are added for you.
@@ -136,6 +138,8 @@ uv pip install torch --index-url https://download.pytorch.org/whl/cu121 --upgrad
 
 Replace `cu121` with the variant matching your driver. See [pytorch.org/get-started/locally](https://pytorch.org/get-started/locally/) for the current list.
 
+---
+
 # Reproducing Paper Results
 
 The full reproducibility package, including the pinned environment, datasets, configurations, and experiment notebooks needed to reproduce all paper results, lives in the [`experiments/`](experiments/) folder. See the [Experiments README](experiments/README.md) for installation instructions and step-by-step guidance on running the experiments.
@@ -156,6 +160,7 @@ This work draws on and integrates methods and implementations from the following
 - [**<u>Nixtla</u>**](https://github.com/Nixtla) – Open Source Time Series Ecosystem.  
 - [**<u>sktime</u>**](https://github.com/sktime/sktime) – A unified framework for machine learning with time series.
 - [**<u>GluonTS</u>**](https://github.com/awslabs/gluonts) – Probabilistic time series modeling and forecasting with deep learning.  
+
 ---
 
 ## License
@@ -178,6 +183,8 @@ If you use `Hyper-Trees` in your research, please cite our paper:
   year    = {2024}
 }
 ```
+
+---
 
 ## History
 <a href="https://star-history.com/#StatMixedML/Hyper-Trees&Date">
