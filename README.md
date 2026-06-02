@@ -19,7 +19,7 @@ While our framework is built upon the well-established LightGBM model, it can in
 
 
 <div align="center">
-  <img src="hypertrees/hyper_treenet.png" width="70%" alt="Hyper-Tree architecture">
+  <img src="https://raw.githubusercontent.com/StatMixedML/Hyper-Trees/main/hypertrees/hyper_treenet.png" width="70%" alt="Hyper-Tree architecture">
 </div>
 
 Hyper-Trees offer several advantages:
