@@ -125,3 +125,65 @@ def calculate_metrics(
     out.attrs["mape_excluded_frac"] = n_excluded / len(true)
 
     return out
+
+def load_air_passengers() -> pd.DataFrame:
+    """Load the Air Passengers dataset in Hyper-Trees format.
+
+    Returns a DataFrame with columns: series_id, date, value, month.
+    The ``month`` column is included as a seasonal feature for the
+    quickstart example.
+
+    Returns
+    -------
+    pd.DataFrame
+        Monthly airline passenger counts (1949–1960).
+    """
+    df = pd.read_csv(
+        "https://datasets-nixtla.s3.amazonaws.com/air-passengers.csv",
+        parse_dates=["ds"],
+    ).rename(columns={"unique_id": "series_id", "ds": "date", "y": "value"})
+
+    return df
+
+def plot_example_forecast(
+    actuals: pd.DataFrame,
+    forecasts: pd.DataFrame,
+) -> None:
+    """Plot actuals vs. Hyper-Tree-AR forecast for the air passengers example.
+
+    Parameters
+    ----------
+    actuals : pd.DataFrame
+        Full series with ``date`` and ``value`` columns.
+    forecasts : pd.DataFrame
+        Forecasts with ``date`` and ``fcst`` columns.
+
+    Returns
+    -------
+    None
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as e:
+        raise ImportError(
+            "matplotlib is required for plotting. "
+            "Install it with: pip install hypertrees[plot]"
+        ) from e
+
+    plt.figure(figsize=(12, 5))
+    datasets = [
+        (actuals, "date", "value", "Actual", "#2E86AB", "-"),
+        (forecasts, "date", "fcst", "Hyper-Tree-AR Forecast", "green", "--"),
+    ]
+    for data, x_col, y_col, label, color, style in datasets:
+        plt.plot(data[x_col], data[y_col], label=label, color=color,
+                 linestyle=style, linewidth=2, alpha=0.8)
+    plt.axvline(x=forecasts["date"].min(), color="black", linestyle=":", alpha=0.7,
+                label="Train/Test Split")
+    plt.title("Forecasting Results - Air Passengers Dataset", fontsize=16)
+    plt.xlabel("Date", fontsize=12)
+    plt.ylabel("Number of Passengers", fontsize=12)
+    plt.legend(fontsize=11)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()

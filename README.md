@@ -53,47 +53,28 @@ All models currently provide point forecasts only. Probabilistic forecasting is 
 
 # Getting Started
 
-The example below trains a `Hyper-Tree-AR` model on the classic AirPassengers series and forecasts the final 12 months. Your data only needs the columns `series_id`, `date`, and `value`; any other columns are automatically treated as features, and the autoregressive lags are added for you.
+The example below trains a `Hyper-Tree-AR` model on the classic AirPassengers series and forecasts the final 12 months. Your data only needs the columns `series_id`, `date`, and `value`. Any other columns are automatically treated as features, and the autoregressive lags are added for you.
 
 ```python
 from hypertrees.models import HyperTreeAR
-import pandas as pd
-import matplotlib.pyplot as plt
+from examples.utils import (load_air_passengers, plot_example_forecast)
 
-# Load data with the required columns: 'series_id', 'date', 'value' and add 'month' as a feature.
-df = pd.read_csv(
-    "https://datasets-nixtla.s3.amazonaws.com/air-passengers.csv",
-    parse_dates=["ds"],
-).rename(columns={"unique_id": "series_id", "ds": "date", "y": "value"})
-df["month"] = df["date"].dt.month
+# Load data and add 'month' as a feature
+dta = load_air_passengers()
+dta["month"] = dta["date"].dt.month
 
+# Split the data into training and testing sets, reserving the last 12 months for testing
 fcst_h = 12
-test = df.tail(fcst_h)
-train = df.drop(test.index)
+test = dta.tail(fcst_h)
+train = dta.drop(test.index)
 
 # Initialize an AR-12 model for monthly data, train, and forecast
-model = HyperTreeAR(p=12, freq="M", fcst_h=fcst_h)
-model.train(lgb_params={"learning_rate": 0.1}, num_iterations=100, train_data=train)
-forecasts = model.forecast(test_data=test)
+ht_model = HyperTreeAR(p=12, freq="M", fcst_h=fcst_h)
+ht_model.train(lgb_params={"learning_rate": 0.1}, num_iterations=100, train_data=train)
+forecasts = ht_model.forecast(test_data=test)
 
 # Plot actuals vs. forecast
-plt.figure(figsize=(12, 5))
-datasets = [
-    (df, "date", "value", "Actual", "#2E86AB", "-"),
-    (forecasts, "date", "fcst", "Hyper-Tree-AR Forecast", "green", "--"),
-]
-for data, x_col, y_col, label, color, style in datasets:
-    plt.plot(data[x_col], data[y_col], label=label, color=color,
-             linestyle=style, linewidth=2, alpha=0.8)
-plt.axvline(x=test["date"].min(), color="black", linestyle=":", alpha=0.7,
-            label="Train/Test Split")
-plt.title("Forecasting Results - Air Passengers Dataset", fontsize=16)
-plt.xlabel("Date", fontsize=12)
-plt.ylabel("Number of Passengers", fontsize=12)
-plt.legend(fontsize=11)
-plt.grid(True, alpha=0.3)
-plt.tight_layout()
-plt.show()
+plot_example_forecast(dta, forecasts)
 ```
 
 <div align="center">
@@ -136,7 +117,7 @@ This installs Hyper-Trees with the latest compatible versions of all dependencie
 
 ### Optional: Extra Dependencies
 
-The example notebooks under `examples/` use `matplotlib` (plotting), `shap` (feature-importance visualization), and `optuna` (hyper-parameter optimization). To install these alongside the package, use the `extras` option:
+The example in this Readme and also the [example notebooks](https://github.com/StatMixedML/Hyper-Trees/tree/main/examples) use `matplotlib` (plotting), `shap` (feature-importance visualization), and `optuna` (hyper-parameter optimization). To install these alongside the package, use the `extras` option:
 
 ```bash
 uv pip install "hypertrees-forecasting[extras]"     # from PyPI
