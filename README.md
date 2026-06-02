@@ -97,7 +97,7 @@ plt.show()
 ```
 
 <div align="center">
-  <img src="https://raw.githubusercontent.com/StatMixedML/Hyper-Trees/main/examples/quickstart_forecast.png" width="80%" alt="Hyper-Tree-AR forecast on the AirPassengers dataset">
+  <img src="https://raw.githubusercontent.com/StatMixedML/Hyper-Trees/main/examples/quickstart_forecast.png" width="85%" alt="Hyper-Tree-AR forecast on the AirPassengers dataset">
 </div>
 
 For more detailed quick-start guides, including hyper-parameter optimization and the other Hyper-Tree models, we refer to the [example notebooks](https://github.com/StatMixedML/Hyper-Trees/tree/main/examples).
