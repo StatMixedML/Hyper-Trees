@@ -42,7 +42,7 @@ dependencies = [
 [project.optional-dependencies]
 extras = [
     "matplotlib>=3.10",
-    "shap>=0.48,<0.51",
+    "shap>=0.48",
     "optuna>=4",
 ]
 
