@@ -10,6 +10,7 @@
 
 </h4>
 
+
 ---
 # Overview
 
@@ -19,7 +20,7 @@ While our framework is built upon the well-established LightGBM model, it can in
 
 
 <div align="center">
-  <img src="https://raw.githubusercontent.com/StatMixedML/Hyper-Trees/main/hypertrees/hyper_treenet.png" width="70%" alt="Hyper-Tree architecture">
+  <img src="https://raw.githubusercontent.com/StatMixedML/Hyper-Trees/main/hypertrees/hyper_treenet.png" width="80%" alt="Hyper-Tree architecture">
 </div>
 
 Hyper-Trees offer several advantages:
@@ -59,7 +60,7 @@ from hypertrees.models import HyperTreeAR
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# Load data with the required columns: 'series_id', 'date', 'value'.
+# Load data with the required columns: 'series_id', 'date', 'value' and add 'month' as a feature.
 df = pd.read_csv(
     "https://datasets-nixtla.s3.amazonaws.com/air-passengers.csv",
     parse_dates=["ds"],
@@ -70,7 +71,7 @@ fcst_h = 12
 test = df.tail(fcst_h)
 train = df.drop(test.index)
 
-# Initialize, train, and forecast
+# Initialize an AR-12 model for monthly data, train, and forecast
 model = HyperTreeAR(p=12, freq="M", fcst_h=fcst_h)
 model.train(lgb_params={"learning_rate": 0.1}, num_iterations=100, train_data=train)
 forecasts = model.forecast(test_data=test)
