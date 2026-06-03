@@ -164,7 +164,7 @@ This work draws on and integrates methods and implementations from the following
 
 - [**<u>LightGBM</u>**](https://github.com/microsoft/LightGBM) – Gradient boosting framework for efficient tree-based learning.  
 - [**<u>PyTorch</u>**](https://github.com/pytorch/pytorch) – Deep learning framework for tensor computation and neural network modeling.  
-- [**<u>Nixtla</u>**](https://github.com/Nixtla) – Open Source Time Series Ecosystem. The conformal prediction intervals in `hypertrees/conformal.py` are adapted from Nixtla's [statsforecast](https://github.com/Nixtla/statsforecast), [mlforecast](https://github.com/Nixtla/mlforecast), and [neuralforecast](https://github.com/Nixtla/neuralforecast) (Apache-2.0); see [`NOTICE`](NOTICE).  
+- [**<u>Nixtla</u>**](https://github.com/Nixtla) – Open Source Time Series Ecosystem. The conformal prediction intervals in `hypertrees/conformal.py` are adapted from Nixtla's [statsforecast](https://github.com/Nixtla/statsforecast), [mlforecast](https://github.com/Nixtla/mlforecast), and [neuralforecast](https://github.com/Nixtla/neuralforecast) (Apache-2.0); see [`NOTICE`](THIRD_PARTY_NOTICES).  
 - [**<u>sktime</u>**](https://github.com/sktime/sktime) – A unified framework for machine learning with time series.
 - [**<u>GluonTS</u>**](https://github.com/awslabs/gluonts) – Probabilistic time series modeling and forecasting with deep learning.  
 
