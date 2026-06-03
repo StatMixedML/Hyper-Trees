@@ -4,9 +4,15 @@ import torch
 import torch.nn as nn
 from torch.autograd import grad as autograd
 import lightgbm as lgb
-from typing import Tuple, Callable, Optional
+from typing import Tuple, Callable, Optional, List
 import time
 from ..utils import TimeSeriesPreprocessor, prepare_datasets, TrainingResult, CustomLogger, validate_series_order, GaussNewtonHessian
+from ..conformal import (
+    ForecastIntervals,
+    validate_calibration_length,
+    rolling_origin_residuals,
+    interval_columns,
+)
 from .mlp import MLP
 import warnings
 lgb.register_logger(CustomLogger())
@@ -181,6 +187,12 @@ class HyperTreeNetAR:
         self._iter_count = 0
         self._fit = None
         self._target = None
+
+        # Conformal prediction interval state
+        self._is_calibrated = False
+        self._cs_scores = None
+        self._cs_series_order = None
+        self._pi_config = None
 
         if hessian_method == "gn":
             self._gn_hessian = GaussNewtonHessian(loss_fn, n_hessian_probes, self.dtype)
@@ -525,6 +537,7 @@ class HyperTreeNetAR:
             seed: int = 123,
             verbose: int = -1,
             deterministic: bool = True,
+            forecast_intervals: Optional[ForecastIntervals] = None,
     ) -> TrainingResult:
         """
         Train the Hyper-TreeNet-AR model on time series data.
@@ -574,6 +587,12 @@ class HyperTreeNetAR:
             If True, sets LightGBM's ``deterministic`` and ``force_row_wise`` parameters to ensure
             reproducible results. May slow down training. See
             https://lightgbm.readthedocs.io/en/latest/Parameters.html#deterministic
+        forecast_intervals : ForecastIntervals, optional
+            If provided, calibrate conformal prediction intervals via rolling-window
+            cross-validation after the main model is trained. The collected conformity
+            scores are then used by ``forecast(..., level=[...])`` to produce
+            ``<model>-lo-<level>`` / ``<model>-hi-<level>`` columns. See
+            :class:`hypertrees.conformal.ForecastIntervals`.
 
         Returns
         -------
@@ -607,6 +626,8 @@ class HyperTreeNetAR:
             raise TypeError("validation must be a boolean.")
         if not isinstance(deterministic, bool):
             raise TypeError("deterministic must be a boolean.")
+        if forecast_intervals is not None and not isinstance(forecast_intervals, ForecastIntervals):
+            raise TypeError("forecast_intervals must be a ForecastIntervals instance.")
         if early_stopping_round is not None and not validation:
             raise ValueError("early_stopping_round can only be used when validation is True.")
         if validation and early_stopping_round is None:
@@ -627,6 +648,11 @@ class HyperTreeNetAR:
         # Validate row ordering: each series must be a contiguous block with
         # monotonic dates so the training reshape and fcst_lags extraction align.
         validate_series_order(train_data, name="train_data")
+
+        if forecast_intervals is not None:
+            validate_calibration_length(
+                train_data, self.fcst_h, forecast_intervals, min_train=self.p + 1
+            )
 
         # Set the network and optimizer
         gbdt_params = lgb_params.copy()
@@ -651,6 +677,10 @@ class HyperTreeNetAR:
         self.dataset_references = {}
         self.is_trained = False
         self.features = None
+        self._is_calibrated = False
+        self._cs_scores = None
+        self._cs_series_order = None
+        self._pi_config = None
 
         # Select objective function based on training mode and Hessian method
         if self.gradient_mode == "separate":
@@ -737,6 +767,38 @@ class HyperTreeNetAR:
             # Set trained flag to True
             self.is_trained = True
 
+            if forecast_intervals is not None:
+                def _model_factory():
+                    return HyperTreeNetAR(
+                        p=self.p,
+                        freq=self.freq,
+                        fcst_h=self.fcst_h,
+                        loss_fn=self.loss_fn,
+                        device=self.device,
+                        hessian_method=self.hessian_method,
+                        n_hessian_probes=self.n_hessian_probes,
+                    )
+
+                cal_train_kwargs = dict(
+                    lgb_params=lgb_params,
+                    network_params=network_params,
+                    gradient_mode=gradient_mode,
+                    num_iterations=num_iterations,
+                    validation=False,
+                    seed=seed,
+                    verbose=verbose,
+                    deterministic=deterministic,
+                )
+                self._cs_scores, self._cs_series_order = rolling_origin_residuals(
+                    model_factory=_model_factory,
+                    train_data=train_data,
+                    fcst_h=self.fcst_h,
+                    forecast_intervals=forecast_intervals,
+                    train_kwargs=cal_train_kwargs,
+                )
+                self._pi_config = forecast_intervals
+                self._is_calibrated = True
+
             # Return results
             result = TrainingResult(
                 train_metrics=evals_result["train"] if validation else {"loss": []},
@@ -756,7 +818,8 @@ class HyperTreeNetAR:
     def forecast(
             self,
             test_data: pd.DataFrame,
-            type: str = "forecast"
+            type: str = "forecast",
+            level: Optional[List[int]] = None,
     ) -> pd.DataFrame:
         """
         Generate forecasts using the trained model.
@@ -781,6 +844,11 @@ class HyperTreeNetAR:
             - "forecast": Generate forecasted values
             - "parameters": Return the AR(p) coefficients used for forecasting
             - "tree_embeddings": Return the tree embeddings
+        level : list of int, optional
+            Confidence levels (in ``(0, 100)``, e.g. ``[80, 90]``) for conformal
+            prediction intervals. Only valid with ``type="forecast"`` and requires
+            the model to have been trained with ``forecast_intervals=...``. Adds
+            ``<model>-lo-<level>`` / ``<model>-hi-<level>`` columns to the output.
 
         Returns
         -------
@@ -788,10 +856,12 @@ class HyperTreeNetAR:
             Forecasted data with columns:
             - series_id: Identifier for each time series
             - date: Forecast date/time
-            - model: Model name identifier
             - fcst: Forecasted value (if type="forecast")
+            - model: Model name identifier
             - AR(i) for i=1..p: AR coefficient values (if type="parameters")
             - tree_embedding_{i} for i=1..embedding_dim: GBDT tree-embedding dimensions (if type="tree_embeddings")
+            - <model>-lo-<level> / <model>-hi-<level>: prediction interval bounds
+              (if type="forecast" and level is provided)
         """
         # Check if model is trained
         if not self.is_trained or self.model is None:
@@ -840,6 +910,21 @@ class HyperTreeNetAR:
         if type not in ["forecast", "parameters", "tree_embeddings"]:
             raise ValueError("Parameter 'type' must be either 'forecast', 'parameters' or 'tree_embeddings'.")
 
+        if level is not None:
+            if type != "forecast":
+                raise ValueError("level is only supported with type='forecast'.")
+            if not self._is_calibrated:
+                raise RuntimeError(
+                    "Prediction intervals were requested via level, but the model "
+                    "was not calibrated. Pass forecast_intervals=ForecastIntervals(...) "
+                    "to train() before forecasting with level."
+                )
+            if not isinstance(level, (list, tuple)) or len(level) == 0:
+                raise ValueError("level must be a non-empty list of integers.")
+            for lv in level:
+                if not isinstance(lv, (int, np.integer)) or not 0 < lv < 100:
+                    raise ValueError(f"level values must be integers in (0, 100); got {lv}.")
+
         try:
             # Get tree embeddings
             gbdt_embeds = torch.tensor(
@@ -876,12 +961,27 @@ class HyperTreeNetAR:
                     lags = np.concatenate([next_val, lags[:, :-1]], axis=1)
 
                 # Create output dataframe based on requested type
+                model_name = f"Hyper-TreeNet-AR({self.p})"
                 out_df = pd.DataFrame({
                     "series_id": test_data["series_id"].to_numpy().flatten(),
                     "date": test_data["date"].to_numpy().flatten(),
                     "fcst": np.hstack(forecasts).flatten(),
-                    "model": f"Hyper-TreeNet-AR({self.p})",
+                    "model": model_name,
                 })
+
+                if level is not None:
+                    point = np.hstack(forecasts)  # (n_series, fcst_h)
+                    columns = interval_columns(
+                        point=point,
+                        scores=self._cs_scores,
+                        levels=level,
+                        method=self._pi_config.method,
+                        model_name=model_name,
+                        cal_order=self._cs_series_order,
+                        target_order=list(test_series_ids),
+                    )
+                    for col_name, values in columns.items():
+                        out_df[col_name] = values
 
             elif type == "parameters":
                 with torch.no_grad():

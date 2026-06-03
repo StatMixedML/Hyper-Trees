@@ -11,6 +11,12 @@ from ..utils import CustomLogger
 lgb.register_logger(CustomLogger())
 
 from ..utils import TimeSeriesPreprocessor, prepare_datasets, TrainingResult, validate_series_order, GaussNewtonHessian
+from ..conformal import (
+    ForecastIntervals,
+    validate_calibration_length,
+    rolling_origin_residuals,
+    interval_columns,
+)
 
 class HyperTreeETS:
     """
@@ -165,6 +171,12 @@ class HyperTreeETS:
 
         # Shared Gauss-Newton Hessian estimator
         self._gn_hessian = GaussNewtonHessian(loss_fn, n_hessian_probes, self.dtype)
+
+        # Conformal prediction interval state
+        self._is_calibrated = False
+        self._cs_scores = None
+        self._cs_series_order = None
+        self._pi_config = None
 
         # Activation function for parameter bounds
         self.sigmoid_fn = nn.Sigmoid()
@@ -555,6 +567,7 @@ class HyperTreeETS:
             seed: int = 123,
             verbose: int = -1,
             deterministic: bool = True,
+            forecast_intervals: Optional[ForecastIntervals] = None,
     ) -> TrainingResult:
         """
         Train the Hyper-Tree-ETS model on time series data.
@@ -593,6 +606,12 @@ class HyperTreeETS:
             If True, sets LightGBM's ``deterministic`` and ``force_row_wise`` parameters to ensure
             reproducible results. May slow down training. See
             https://lightgbm.readthedocs.io/en/latest/Parameters.html#deterministic
+        forecast_intervals : ForecastIntervals, optional
+            If provided, calibrate conformal prediction intervals via rolling-window
+            cross-validation after the main model is trained. The collected conformity
+            scores are then used by ``forecast(..., level=[...])`` to produce
+            ``<model>-lo-<level>`` / ``<model>-hi-<level>`` columns. See
+            :class:`hypertrees.conformal.ForecastIntervals`.
 
         Returns
         -------
@@ -621,6 +640,8 @@ class HyperTreeETS:
             raise TypeError("validation must be a boolean.")
         if not isinstance(deterministic, bool):
             raise TypeError("deterministic must be a boolean.")
+        if forecast_intervals is not None and not isinstance(forecast_intervals, ForecastIntervals):
+            raise TypeError("forecast_intervals must be a ForecastIntervals instance.")
         if early_stopping_round is not None and not validation:
             raise ValueError("early_stopping_round can only be used when validation is True.")
         if validation and early_stopping_round is None:
@@ -638,6 +659,12 @@ class HyperTreeETS:
         # Validate row ordering: each series must be a contiguous block with
         # monotonic dates so the ETS reshape to (n_series, T, n_params) aligns.
         validate_series_order(train_data, name="train_data")
+
+        if forecast_intervals is not None:
+            validate_calibration_length(
+                train_data, self.fcst_h, forecast_intervals,
+                min_train=self.season_length + 1,
+            )
 
         # Check if all series in train_data have the same length
         unique_lengths = train_data.groupby('series_id')['date'].nunique()
@@ -663,6 +690,10 @@ class HyperTreeETS:
         self.is_trained = False
         self.fcst_states = None
         self.features = None
+        self._is_calibrated = False
+        self._cs_scores = None
+        self._cs_series_order = None
+        self._pi_config = None
 
         # Set random seeds for reproducibility
         torch.manual_seed(seed)
@@ -728,6 +759,36 @@ class HyperTreeETS:
 
             # Set trained flag to True
             self.is_trained = True
+
+            if forecast_intervals is not None:
+                def _model_factory():
+                    return HyperTreeETS(
+                        ets_type=self.ets_type,
+                        season_length=self.season_length,
+                        seasonality_feature=self.seasonality_feature,
+                        freq=self.freq,
+                        fcst_h=self.fcst_h,
+                        loss_fn=self.loss_fn,
+                        n_hessian_probes=self.n_hessian_probes,
+                    )
+
+                cal_train_kwargs = dict(
+                    lgb_params=lgb_params,
+                    num_iterations=num_iterations,
+                    validation=False,
+                    seed=seed,
+                    verbose=verbose,
+                    deterministic=deterministic,
+                )
+                self._cs_scores, self._cs_series_order = rolling_origin_residuals(
+                    model_factory=_model_factory,
+                    train_data=train_data,
+                    fcst_h=self.fcst_h,
+                    forecast_intervals=forecast_intervals,
+                    train_kwargs=cal_train_kwargs,
+                )
+                self._pi_config = forecast_intervals
+                self._is_calibrated = True
 
             # Return results
             result = TrainingResult(
@@ -799,7 +860,8 @@ class HyperTreeETS:
     def forecast(
             self,
             test_data: pd.DataFrame,
-            type: str = "forecast"
+            type: str = "forecast",
+            level: Optional[List[int]] = None,
     ) -> pd.DataFrame:
         """
         Generate forecasts using the trained model.
@@ -821,6 +883,11 @@ class HyperTreeETS:
             Type of forecast to generate. Options:
             - "forecast": Generate forecasted values
             - "parameters": Return the ETS parameters used for forecasting
+        level : list of int, optional
+            Confidence levels (in ``(0, 100)``, e.g. ``[80, 90]``) for conformal
+            prediction intervals. Only valid with ``type="forecast"`` and requires
+            the model to have been trained with ``forecast_intervals=...``. Adds
+            ``<model>-lo-<level>`` / ``<model>-hi-<level>`` columns to the output.
 
         Returns
         -------
@@ -828,9 +895,11 @@ class HyperTreeETS:
             Forecasted data with columns:
             - series_id: Identifier for each time series
             - date: Forecast date/time
-            - model: Model name identifier
             - fcst: Forecasted value (if type="forecast")
+            - model: Model name identifier
             - alpha, beta, gamma, phi: ETS parameter values (if type="parameters")
+            - <model>-lo-<level> / <model>-hi-<level>: prediction interval bounds
+              (if type="forecast" and level is provided)
         """
         # Check if model is trained and states are stored
         if not self.is_trained or self.model is None:
@@ -875,6 +944,21 @@ class HyperTreeETS:
         # Validate type parameter
         if type not in ["forecast", "parameters"]:
             raise ValueError("Parameter 'type' must be either 'forecast' or 'parameters'")
+
+        if level is not None:
+            if type != "forecast":
+                raise ValueError("level is only supported with type='forecast'.")
+            if not self._is_calibrated:
+                raise RuntimeError(
+                    "Prediction intervals were requested via level, but the model "
+                    "was not calibrated. Pass forecast_intervals=ForecastIntervals(...) "
+                    "to train() before forecasting with level."
+                )
+            if not isinstance(level, (list, tuple)) or len(level) == 0:
+                raise ValueError("level must be a non-empty list of integers.")
+            for lv in level:
+                if not isinstance(lv, (int, np.integer)) or not 0 < lv < 100:
+                    raise ValueError(f"level values must be integers in (0, 100); got {lv}.")
 
         try:
             # If mask was a training feature but is absent from test_data, add it (all test obs are valid)
@@ -982,12 +1066,28 @@ class HyperTreeETS:
                         trend_h = trend_new
 
                 # Create output dataframe
+                model_name = f"Hyper-Tree-ETS({self.ets_type})"
                 out_df = pd.DataFrame({
                     "series_id": test_data["series_id"].to_numpy().flatten(),
                     "date": test_data["date"].to_numpy().flatten(),
                     "fcst": torch.cat(fcsts, dim=1).flatten().numpy(),
-                    "model": f"Hyper-Tree-ETS({self.ets_type})",
+                    "model": model_name,
                 })
+
+                if level is not None:
+                    point = torch.cat(fcsts, dim=1).numpy()  # (n_series, fcst_h)
+                    test_series_ids = test_data["series_id"].unique()
+                    columns = interval_columns(
+                        point=point,
+                        scores=self._cs_scores,
+                        levels=level,
+                        method=self._pi_config.method,
+                        model_name=model_name,
+                        cal_order=self._cs_series_order,
+                        target_order=list(test_series_ids),
+                    )
+                    for col_name, values in columns.items():
+                        out_df[col_name] = values
 
             elif type == "parameters":
                 fcst_params = torch.clamp(

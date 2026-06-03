@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 from hypertrees.models.HyperTreeETS import HyperTreeETS
 from hypertrees.utils import TrainingResult
+from hypertrees import ForecastIntervals
 
 
 class TestHyperTreeETSInitialization:
@@ -803,3 +804,75 @@ class TestHyperTreeETSStoreFinalStates:
             assert torch.isfinite(st["last_level"]).item()
             assert torch.isfinite(st["last_trend"]).item()
             assert torch.isfinite(st["seasonality"]).all()
+
+
+class TestHyperTreeETSConformal:
+    """Tests for conformal prediction intervals on HyperTreeETS."""
+
+    FCST_H = 4
+    N_SERIES = 2
+    N_OBS = 60
+    LGB_PARAMS = {"learning_rate": 0.1, "num_leaves": 15, "min_data_in_leaf": 1, "min_data_in_bin": 1}
+
+    def _make_data(self):
+        rng = np.random.default_rng(42)
+        dates = pd.date_range("2015-01-01", periods=self.N_OBS, freq="MS")
+        frames = []
+        for sid in range(self.N_SERIES):
+            frames.append(pd.DataFrame({
+                "series_id": sid, "date": dates,
+                "value": rng.standard_normal(self.N_OBS).cumsum() + 100,
+                "month": dates.month, "quarter": dates.quarter,
+            }))
+        return pd.concat(frames, ignore_index=True)
+
+    def _split(self, df):
+        test = df.groupby("series_id", sort=False).tail(self.FCST_H).reset_index(drop=True)
+        train = df.drop(df.groupby("series_id", sort=False).tail(self.FCST_H).index).reset_index(drop=True)
+        return train, test
+
+    @pytest.fixture
+    def split(self):
+        return self._split(self._make_data())
+
+    @pytest.fixture
+    def calibrated(self, split):
+        train, test = split
+        model = HyperTreeETS(ets_type="trend", season_length=12, freq="M", fcst_h=self.FCST_H)
+        model.train(lgb_params=self.LGB_PARAMS, num_iterations=20, train_data=train,
+                     forecast_intervals=ForecastIntervals(n_windows=3, refit=False))
+        return model, train, test
+
+    def test_calibration_sets_state(self, calibrated):
+        model, _, _ = calibrated
+        assert model._is_calibrated is True
+        assert model._cs_scores.shape == (3, self.N_SERIES, self.FCST_H)
+        assert np.all(model._cs_scores >= 0)
+
+    def test_no_calibration_by_default(self, split):
+        train, _ = split
+        model = HyperTreeETS(ets_type="trend", season_length=12, freq="M", fcst_h=self.FCST_H)
+        model.train(lgb_params=self.LGB_PARAMS, num_iterations=20, train_data=train)
+        assert model._is_calibrated is False
+
+    def test_forecast_adds_interval_columns(self, calibrated):
+        model, _, test = calibrated
+        mn = "Hyper-Tree-ETS(trend)"
+        out = model.forecast(test_data=test, level=[80, 90])
+        for lv in [80, 90]:
+            assert f"{mn}-lo-{lv}" in out.columns
+            assert f"{mn}-hi-{lv}" in out.columns
+
+    def test_interval_nesting(self, calibrated):
+        model, _, test = calibrated
+        mn = "Hyper-Tree-ETS(trend)"
+        out = model.forecast(test_data=test, level=[80, 90])
+        assert np.all(out[f"{mn}-lo-90"].to_numpy() <= out[f"{mn}-lo-80"].to_numpy() + 1e-9)
+        assert np.all(out[f"{mn}-hi-80"].to_numpy() <= out[f"{mn}-hi-90"].to_numpy() + 1e-9)
+
+    def test_level_without_calibration_raises(self, split):
+        train, test = split
+        model = HyperTreeETS(ets_type="trend", season_length=12, freq="M", fcst_h=self.FCST_H)
+        model.train(lgb_params=self.LGB_PARAMS, num_iterations=20, train_data=train)
+        with pytest.raises(RuntimeError, match="not calibrated"):
+            model.forecast(test_data=test, level=[90])

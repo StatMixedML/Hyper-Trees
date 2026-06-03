@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import re
 
 
 def calculate_metrics(
@@ -148,19 +149,14 @@ def load_air_passengers() -> pd.DataFrame:
 def plot_example_forecast(
     actuals: pd.DataFrame,
     forecasts: pd.DataFrame,
+    levels: list = None,
 ) -> None:
-    """Plot actuals vs. Hyper-Tree-AR forecast for the air passengers example.
+    """Plot actuals vs. Hyper-Tree-AR forecast, shading any conformal intervals.
 
-    Parameters
-    ----------
-    actuals : pd.DataFrame
-        Full series with ``date`` and ``value`` columns.
-    forecasts : pd.DataFrame
-        Forecasts with ``date`` and ``fcst`` columns.
-
-    Returns
-    -------
-    None
+    If ``forecasts`` contains conformal interval columns named
+    ``<model>-lo-<level>`` / ``<model>-hi-<level>`` (produced by
+    ``forecast(..., level=[...])``), each band is shaded. Pass ``levels`` to
+    restrict which are drawn; by default all detected levels are shown.
     """
     try:
         import matplotlib.pyplot as plt
@@ -171,15 +167,34 @@ def plot_example_forecast(
         ) from e
 
     plt.figure(figsize=(12, 5))
-    datasets = [
-        (actuals, "date", "value", "Actual", "#2E86AB", "-"),
-        (forecasts, "date", "fcst", "Hyper-Tree-AR Forecast", "green", "--"),
-    ]
-    for data, x_col, y_col, label, color, style in datasets:
-        plt.plot(data[x_col], data[y_col], label=label, color=color,
-                 linestyle=style, linewidth=2, alpha=0.8)
-    plt.axvline(x=forecasts["date"].min(), color="black", linestyle=":", alpha=0.7,
-                label="Train/Test Split")
+    plt.plot(actuals["date"], actuals["value"], label="Actual",
+             color="#2E86AB", linestyle="-", linewidth=2, alpha=0.8)
+    plt.plot(forecasts["date"], forecasts["fcst"], label="Hyper-Tree-AR Forecast",
+             color="green", linestyle="--", linewidth=2, alpha=0.8)
+
+    # Detect and shade conformal interval bands, if present.
+    model = forecasts["model"].iloc[0] if "model" in forecasts.columns else None
+    if model is not None:
+        detected = sorted(
+            int(m.group(1))
+            for c in forecasts.columns
+            for m in [re.fullmatch(rf"{re.escape(model)}-lo-(\d+)", c)]
+            if m
+        )
+        if levels is not None:
+            detected = [lv for lv in detected if lv in set(levels)]
+        # Shade widest band first so narrower bands sit on top.
+        alphas = [0.15, 0.28, 0.40]
+        shade = {lv: a for lv, a in zip(sorted(detected, reverse=True), alphas)}
+        for lv in sorted(detected, reverse=True):
+            plt.fill_between(
+                forecasts["date"],
+                forecasts[f"{model}-lo-{lv}"],
+                forecasts[f"{model}-hi-{lv}"],
+                color="green", alpha=shade.get(lv, 0.2), label=f"{lv}% interval",
+            )
+
+    plt.axvline(x=forecasts["date"].min(), color="black", linestyle=":", alpha=0.7, label="Train/Test Split")
     plt.title("Forecasting Results - Air Passengers Dataset", fontsize=16)
     plt.xlabel("Date", fontsize=12)
     plt.ylabel("Number of Passengers", fontsize=12)
@@ -187,3 +202,79 @@ def plot_example_forecast(
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.show()
+
+
+def coverage(
+    df: pd.DataFrame,
+    level: int,
+    model: str,
+    value_col: str = "value",
+) -> float:
+    r"""Empirical coverage of a conformal prediction interval.
+
+    Computes the fraction of realized values that fall within the
+    ``[<model>-lo-<level>, <model>-hi-<level>]`` band, reported in percent.
+    For a well-calibrated ``level``% interval this should be close to ``level``.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Forecast output containing ``value_col`` plus the interval columns
+        ``f"{model}-lo-{level}"`` and ``f"{model}-hi-{level}"``.
+    level : int
+        Nominal confidence level (e.g. ``90``).
+    model : str
+        Model-name prefix used for the interval columns (the ``model`` column
+        value, e.g. ``"Hyper-Tree-AR(12)"``).
+    value_col : str, default "value"
+        Column holding the realized values.
+
+    Returns
+    -------
+    float
+        Empirical coverage in percent, in ``[0, 100]``.
+    """
+    lo_col, hi_col = f"{model}-lo-{level}", f"{model}-hi-{level}"
+    missing = {value_col, lo_col, hi_col} - set(df.columns)
+    if missing:
+        raise KeyError(f"Missing columns: {sorted(missing)}.")
+
+    true = df[value_col].to_numpy(dtype=np.float64)
+    lo = df[lo_col].to_numpy(dtype=np.float64)
+    hi = df[hi_col].to_numpy(dtype=np.float64)
+    inside = (true >= lo) & (true <= hi)
+    return float(np.mean(inside) * 100)
+
+
+def mean_interval_width(
+    df: pd.DataFrame,
+    level: int,
+    model: str,
+) -> float:
+    """Mean width of a conformal prediction interval.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Forecast output containing ``f"{model}-lo-{level}"`` and
+        ``f"{model}-hi-{level}"``.
+    level : int
+        Nominal confidence level (e.g. ``90``).
+    model : str
+        Model-name prefix used for the interval columns.
+
+    Returns
+    -------
+    float
+        Mean of ``hi - lo`` across all rows.
+    """
+    lo_col, hi_col = f"{model}-lo-{level}", f"{model}-hi-{level}"
+    missing = {lo_col, hi_col} - set(df.columns)
+    if missing:
+        raise KeyError(f"Missing columns: {sorted(missing)}.")
+
+    lo = df[lo_col].to_numpy(dtype=np.float64)
+    hi = df[hi_col].to_numpy(dtype=np.float64)
+
+    return float(np.mean(hi - lo))
+

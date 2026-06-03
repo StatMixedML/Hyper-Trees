@@ -34,6 +34,7 @@ Hyper-Trees offer several advantages:
 ---
 
 # News
+[2026-06-03] v0.2.0 adds support for forecast intervals via conformal prediction.<br>
 [2026-06-01] v0.1.0 released on [PyPI](https://pypi.org/project/hypertrees-forecasting/).<br>
 [2024-05-01] Create repository and initial commits.
 
@@ -49,7 +50,7 @@ Hyper-Trees offer several advantages:
 | **`Hyper-Tree-STL`** | STL decomposition with tree-learned parameters for trend and seasonality. | ![](https://img.shields.io/badge/Local-green) |
 
 `Global` means a single model is trained across multiple time series; `Local` means a separate model is trained for each individual series.
-All models currently provide point forecasts only. Probabilistic forecasting is planned for future releases. Note on `Hyper-Tree-STL`: it is designed to decompose time series into trend and seasonal components and is not intended for forecasting. However, the STL-parameters can still be used to generate forecasts.
+All models produce point forecasts and support conformal prediction intervals via `ForecastIntervals` (see [Getting Started](#getting-started)). Full distributional (probabilistic) forecasting is planned for future releases. Note on `Hyper-Tree-STL`: it is designed to decompose time series into trend and seasonal components and is not intended for forecasting. However, the STL-parameters can still be used to generate forecasts.
 
 ---
 
@@ -59,6 +60,7 @@ The example below trains a `Hyper-Tree-AR` model on the classic AirPassengers se
 
 ```python
 from hypertrees.models import HyperTreeAR
+from hypertrees import ForecastIntervals
 from examples.utils import (load_air_passengers, plot_example_forecast)
 
 # Load data and add 'month' as a feature
@@ -70,10 +72,15 @@ fcst_h = 12
 test = dta.tail(fcst_h)
 train = dta.drop(test.index)
 
-# Initialize an AR-12 model for monthly data, train, and forecast
+# Initialize an AR-12 model for monthly data, calibrate conformal intervals, and forecast
+ci_levels = [80, 90]
 ht_model = HyperTreeAR(p=12, freq="M", fcst_h=fcst_h)
-ht_model.train(lgb_params={"learning_rate": 0.1}, num_iterations=100, train_data=train)
-forecasts = ht_model.forecast(test_data=test)
+ht_model.train(
+    lgb_params={"learning_rate": 0.1},
+    train_data=train,
+    forecast_intervals=ForecastIntervals(n_windows=5),   # calibrate intervals
+)
+forecasts = ht_model.forecast(test_data=test, level=ci_levels)
 
 # Plot actuals vs. forecast
 plot_example_forecast(dta, forecasts)

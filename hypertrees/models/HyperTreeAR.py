@@ -6,12 +6,18 @@ import torch
 import torch.nn as nn
 from torch.autograd import grad as autograd
 import lightgbm as lgb
-from typing import Tuple, Callable, Optional
+from typing import Tuple, Callable, Optional, List
 import time
 from ..utils import CustomLogger
 lgb.register_logger(CustomLogger())
 
 from ..utils import TimeSeriesPreprocessor, prepare_datasets, TrainingResult, validate_series_order, GaussNewtonHessian
+from ..conformal import (
+    ForecastIntervals,
+    validate_calibration_length,
+    rolling_origin_residuals,
+    interval_columns,
+)
 
 class HyperTreeAR:
     """
@@ -154,6 +160,13 @@ class HyperTreeAR:
         self._iter_count = 0
         self._fit = None
         self._target = None
+
+        # Conformal prediction interval state (populated when train() is called
+        # with forecast_intervals).
+        self._is_calibrated = False
+        self._cs_scores = None          # conformity scores (n_windows, n_series, fcst_h)
+        self._cs_series_order = None    # series order along axis 1 of _cs_scores
+        self._pi_config = None          # ForecastIntervals configuration
 
         # Bind Hessian computation strategy
         if hessian_method == "exact":
@@ -320,6 +333,7 @@ class HyperTreeAR:
             seed: int = 123,
             verbose: int = -1,
             deterministic: bool = True,
+            forecast_intervals: Optional[ForecastIntervals] = None,
     ) -> TrainingResult:
         """
         Train the Hyper-Tree-AR model on time series data.
@@ -356,6 +370,12 @@ class HyperTreeAR:
             If True, sets LightGBM's ``deterministic`` and ``force_row_wise`` parameters to ensure
             reproducible results. May slow down training. See
             https://lightgbm.readthedocs.io/en/latest/Parameters.html#deterministic
+        forecast_intervals : ForecastIntervals, optional
+            If provided, calibrate conformal prediction intervals via rolling-window
+            cross-validation after the main model is trained. The collected conformity
+            scores are then used by ``forecast(..., level=[...])`` to produce
+            ``<model>-lo-<level>`` / ``<model>-hi-<level>`` columns. See
+            :class:`hypertrees.conformal.ForecastIntervals`.
 
         Returns
         -------
@@ -383,6 +403,8 @@ class HyperTreeAR:
             raise TypeError("validation must be a boolean.")
         if not isinstance(deterministic, bool):
             raise TypeError("deterministic must be a boolean.")
+        if forecast_intervals is not None and not isinstance(forecast_intervals, ForecastIntervals):
+            raise TypeError("forecast_intervals must be a ForecastIntervals instance.")
         if early_stopping_round is not None and not validation:
             raise ValueError("early_stopping_round can only be used when validation is True.")
         if validation and early_stopping_round is None:
@@ -400,6 +422,13 @@ class HyperTreeAR:
         # Validate row ordering: each series must be a contiguous block with
         # monotonic dates so the training reshape and fcst_lags extraction align.
         validate_series_order(train_data, name="train_data")
+
+        # Fail fast if any series is too short for the requested conformal calibration.
+        # An AR(p) model needs at least p + 1 rows to retain one training sample.
+        if forecast_intervals is not None:
+            validate_calibration_length(
+                train_data, self.fcst_h, forecast_intervals, min_train=self.p + 1
+            )
 
         # General model parameters
         self.lgb_params = {
@@ -421,6 +450,10 @@ class HyperTreeAR:
         self.dataset_references = {}
         self.is_trained = False
         self.features = None
+        self._is_calibrated = False
+        self._cs_scores = None
+        self._cs_series_order = None
+        self._pi_config = None
 
         try:
             # Initialize TimeSeriesPreprocessor for creating lagged dataframe
@@ -481,6 +514,38 @@ class HyperTreeAR:
             # Set trained flag to True
             self.is_trained = True
 
+            # Calibrate conformal prediction intervals via rolling-window CV.
+            # Fresh model instances are trained per window (no forecast_intervals
+            # passed, so there is no recursion) using the same hyper-parameters.
+            if forecast_intervals is not None:
+                def _model_factory():
+                    return HyperTreeAR(
+                        p=self.p,
+                        freq=self.freq,
+                        fcst_h=self.fcst_h,
+                        loss_fn=self.loss_fn,
+                        hessian_method=self.hessian_method,
+                        n_hessian_probes=self.n_hessian_probes,
+                    )
+
+                cal_train_kwargs = dict(
+                    lgb_params=lgb_params,
+                    num_iterations=num_iterations,
+                    validation=False,
+                    seed=seed,
+                    verbose=verbose,
+                    deterministic=deterministic,
+                )
+                self._cs_scores, self._cs_series_order = rolling_origin_residuals(
+                    model_factory=_model_factory,
+                    train_data=train_data,
+                    fcst_h=self.fcst_h,
+                    forecast_intervals=forecast_intervals,
+                    train_kwargs=cal_train_kwargs,
+                )
+                self._pi_config = forecast_intervals
+                self._is_calibrated = True
+
             # Return results
             result = TrainingResult(
                 train_metrics=evals_result["train"] if validation else {"loss": []},
@@ -499,7 +564,8 @@ class HyperTreeAR:
     def forecast(
             self,
             test_data: pd.DataFrame,
-            type: str = "forecast"
+            type: str = "forecast",
+            level: Optional[List[int]] = None
     ) -> pd.DataFrame:
         """
         Generate forecasts using the trained model.
@@ -523,6 +589,11 @@ class HyperTreeAR:
             Type of forecast to generate. Options:
             - "forecast": Generate forecasted values
             - "parameters": Return the AR(p) coefficients used for forecasting
+        level : list of int, optional
+            Confidence levels (in ``(0, 100)``, e.g. ``[80, 90]``) for conformal
+            prediction intervals. Only valid with ``type="forecast"`` and requires
+            the model to have been trained with ``forecast_intervals=...``. Adds
+            ``<model>-lo-<level>`` / ``<model>-hi-<level>`` columns to the output.
 
         Returns
         -------
@@ -533,6 +604,8 @@ class HyperTreeAR:
             - fcst: Forecasted value (if type="forecast")
             - model: Model name identifier
             - AR(i): AR coefficient values (if type="parameters")
+            - <model>-lo-<level> / <model>-hi-<level>: prediction interval bounds
+              (if type="forecast" and level is provided)
         """
         # Check if model is trained
         if not self.is_trained or self.model is None:
@@ -581,6 +654,22 @@ class HyperTreeAR:
         if type not in ["forecast", "parameters"]:
             raise ValueError("Parameter 'type' must be either 'forecast' or 'parameters'")
 
+        # Validate conformal interval request
+        if level is not None:
+            if type != "forecast":
+                raise ValueError("level is only supported with type='forecast'.")
+            if not self._is_calibrated:
+                raise RuntimeError(
+                    "Prediction intervals were requested via level, but the model "
+                    "was not calibrated. Pass forecast_intervals=ForecastIntervals(...) "
+                    "to train() before forecasting with level."
+                )
+            if not isinstance(level, (list, tuple)) or len(level) == 0:
+                raise ValueError("level must be a non-empty list of integers.")
+            for lv in level:
+                if not isinstance(lv, (int, np.integer)) or not 0 < lv < 100:
+                    raise ValueError(f"level values must be integers in (0, 100); got {lv}.")
+
         try:
 
             if type == "forecast":
@@ -603,12 +692,28 @@ class HyperTreeAR:
                     lags = np.concatenate([next_val, lags[:, :-1]], axis=1)
 
                 # Create output dataframe based on requested type
+                model_name = f"Hyper-Tree-AR({self.p})"
                 out_df = pd.DataFrame({
                     "series_id": test_data["series_id"].to_numpy().flatten(),
                     "date": test_data["date"].to_numpy().flatten(),
                     "fcst": np.hstack(forecasts).flatten(),
-                    "model": f"Hyper-Tree-AR({self.p})",
+                    "model": model_name,
                 })
+
+                # Append conformal prediction intervals if requested.
+                if level is not None:
+                    point = np.hstack(forecasts)  # (n_series_test, fcst_h)
+                    columns = interval_columns(
+                        point=point,
+                        scores=self._cs_scores,
+                        levels=level,
+                        method=self._pi_config.method,
+                        model_name=model_name,
+                        cal_order=self._cs_series_order,
+                        target_order=list(test_series_ids),
+                    )
+                    for col_name, values in columns.items():
+                        out_df[col_name] = values
 
             elif type == "parameters":
                 params_fcst = np.asarray(self.model.predict(test_data[self.features]))
