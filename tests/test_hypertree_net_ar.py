@@ -98,9 +98,51 @@ class TestHyperTreeNetARInitialization:
             HyperTreeNetAR(n_hessian_probes=0)
 
 
+class TestHyperTreeNetARSetForecastOrigin:
+    """Test HyperTreeNetAR.set_forecast_origin."""
+
+    def test_updates_fcst_lags(self):
+        """set_forecast_origin should store last p values per series in reverse order."""
+        model = HyperTreeNetAR(p=3, freq="M", fcst_h=2)
+        history = pd.DataFrame({
+            "series_id": [0]*6 + [1]*6,
+            "date": list(pd.date_range("2020-01-01", periods=6, freq="MS")) * 2,
+            "value": [10, 20, 30, 40, 50, 60] + [100, 200, 300, 400, 500, 600],
+        })
+        model.set_forecast_origin(history)
+        np.testing.assert_array_equal(model.fcst_lags[0], [60, 50, 40])
+        np.testing.assert_array_equal(model.fcst_lags[1], [600, 500, 400])
+
+    def test_reanchor_changes_lags(self):
+        """Calling set_forecast_origin twice should update the lags."""
+        model = HyperTreeNetAR(p=2, freq="M", fcst_h=1)
+        dates = pd.date_range("2020-01-01", periods=5, freq="MS")
+        history1 = pd.DataFrame({
+            "series_id": [0]*5, "date": dates, "value": [1, 2, 3, 4, 5],
+        })
+        history2 = pd.DataFrame({
+            "series_id": [0]*5, "date": dates, "value": [10, 20, 30, 40, 50],
+        })
+        model.set_forecast_origin(history1)
+        np.testing.assert_array_equal(model.fcst_lags[0], [5, 4])
+        model.set_forecast_origin(history2)
+        np.testing.assert_array_equal(model.fcst_lags[0], [50, 40])
+
+    def test_validates_series_order(self):
+        """set_forecast_origin should reject non-contiguous series."""
+        model = HyperTreeNetAR(p=2, freq="M", fcst_h=1)
+        bad = pd.DataFrame({
+            "series_id": [0, 1, 0],
+            "date": pd.date_range("2020-01-01", periods=3, freq="MS"),
+            "value": [1, 2, 3],
+        })
+        with pytest.raises(ValueError, match="non-contiguous"):
+            model.set_forecast_origin(bad)
+
+
 class TestHyperTreeNetARTraining:
     """Test HyperTreeNetAR training functionality."""
-    
+
     @pytest.fixture
     def sample_train_data(self):
         """Create sample training data for testing."""

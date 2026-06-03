@@ -17,6 +17,30 @@ class TrainingResult:
   training_time: Optional[float] = None
 
 
+def extract_forecast_lags(history: pd.DataFrame, p: int) -> dict:
+    """Extract the last *p* values per series as the AR forecast seed.
+
+    Parameters
+    ----------
+    history : pd.DataFrame
+        Must contain ``series_id`` and ``value`` columns, ordered by
+        ``(series_id, date)`` with each series in a contiguous block.
+    p : int
+        Number of AR lags.
+
+    Returns
+    -------
+    dict
+        ``{series_id: np.ndarray}`` with each array of length *p* in
+        newest-first order, matching the convention used by ``forecast()``.
+    """
+    return (
+        history.groupby(["series_id"], sort=False)
+        .apply(lambda x: x["value"][-p:][::-1].values)
+        .to_dict()
+    )
+
+
 def validate_series_order(data: pd.DataFrame, name: str = "data") -> None:
     """
     Validate that a time series DataFrame is ordered so each series' rows are

@@ -6,7 +6,7 @@ from torch.autograd import grad as autograd
 import lightgbm as lgb
 from typing import Tuple, Callable, Optional, List
 import time
-from ..utils import TimeSeriesPreprocessor, prepare_datasets, TrainingResult, CustomLogger, validate_series_order, GaussNewtonHessian
+from ..utils import TimeSeriesPreprocessor, prepare_datasets, TrainingResult, CustomLogger, validate_series_order, extract_forecast_lags, GaussNewtonHessian
 from ..conformal import (
     ForecastIntervals,
     validate_calibration_length,
@@ -745,11 +745,7 @@ class HyperTreeNetAR:
             self.lags_eval = lags_eval.to(self.device) if lags_eval is not None else None
 
             # Store lagged train values to be used in the forecast method
-            self.fcst_lags = (
-                train_data.groupby(["series_id"], sort=False)
-                .apply(lambda x: x["value"][-self.p:][::-1].values)
-                .to_dict()
-            )
+            self.set_forecast_origin(train_data)
 
             # Train model
             start_time = time.time()
@@ -814,6 +810,18 @@ class HyperTreeNetAR:
         except Exception as e:
             self.is_trained = False
             raise RuntimeError(f"Training failed: {str(e)}")
+
+    def set_forecast_origin(self, history: pd.DataFrame) -> None:
+        """Re-anchor the AR lag seed to the end of *history* without retraining.
+
+        Parameters
+        ----------
+        history : pd.DataFrame
+            DataFrame with ``series_id``, ``date``, ``value`` columns, ordered
+            by ``(series_id, date)`` with each series in a contiguous block.
+        """
+        validate_series_order(history, name="history")
+        self.fcst_lags = extract_forecast_lags(history, self.p)
 
     def forecast(
             self,

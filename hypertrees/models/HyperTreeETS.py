@@ -857,6 +857,24 @@ class HyperTreeETS:
             for i, series_id in enumerate(self.series_order):
                 self.fcst_states[series_id]['seasonality'] = seasonality[i]
 
+    def set_forecast_origin(self, history: pd.DataFrame) -> None:
+        """Re-anchor ETS states to the end of *history* without retraining.
+
+        Recomputes the terminal ``{level, trend, seasonality}`` states by
+        running the full ETS forward recurrence over *history* using the
+        already-trained GBDT parameters.  Used by conformal calibration with
+        ``refit=False``.
+
+        Parameters
+        ----------
+        history : pd.DataFrame
+            DataFrame with the same columns as the training data (including
+            any ``mask`` / ``seasonality_feature`` columns), ordered by
+            ``(series_id, date)`` with each series in a contiguous block and
+            all series of equal length.
+        """
+        self._store_final_states(history)
+
     def forecast(
             self,
             test_data: pd.DataFrame,

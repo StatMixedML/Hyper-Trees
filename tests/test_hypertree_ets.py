@@ -69,6 +69,24 @@ class TestHyperTreeETSInitialization:
             HyperTreeETS(ets_type="trend", season_length=4, freq=123)
 
 
+class TestHyperTreeETSSetForecastOrigin:
+    """Test HyperTreeETS.set_forecast_origin delegates to _store_final_states."""
+
+    def test_delegates_to_store_final_states(self):
+        """set_forecast_origin should call _store_final_states."""
+        model = HyperTreeETS(ets_type="trend", season_length=4, freq="Q")
+        called_with = []
+        model._store_final_states = lambda df: called_with.append(df)
+        history = pd.DataFrame({
+            "series_id": [0]*8,
+            "date": pd.date_range("2020-01-01", periods=8, freq="QS"),
+            "value": list(range(8)),
+        })
+        model.set_forecast_origin(history)
+        assert len(called_with) == 1
+        assert called_with[0] is history
+
+
 class TestHyperTreeETSTraining:
     """Test HyperTreeETS training functionality."""
 

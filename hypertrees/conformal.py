@@ -150,15 +150,19 @@ def rolling_origin_residuals(
 
     When ``forecast_intervals.refit`` is ``True`` (default) a fresh model is
     trained for every window. When ``False``, a single model is trained on the
-    oldest window's training split and reused to forecast all windows (matching
-    Nixtla's ``mlforecast`` with ``refit=False``).
+    oldest window's training split and reused to forecast all windows. Before
+    each window's forecast the model's forecast seed (lags, states, etc.) is
+    re-anchored to the window's own history via ``set_forecast_origin``, so
+    that residuals reflect the correct origin — only the GBDT refit is skipped.
 
     Parameters
     ----------
     model_factory : Callable[[], object]
         Zero-argument callable returning a fresh, untrained model exposing
-        ``train(train_data=..., **train_kwargs)`` and
-        ``forecast(test_data=..., type="forecast")``.
+        ``train(train_data=..., **train_kwargs)``,
+        ``forecast(test_data=..., type="forecast")``, and
+        ``set_forecast_origin(history: pd.DataFrame)`` (required for
+        ``refit=False``; re-anchors the forecast seed without retraining).
     train_data : pd.DataFrame
         Full training data (``series_id``, ``date``, ``value`` + features).
     fcst_h : int
@@ -216,6 +220,8 @@ def rolling_origin_residuals(
             model.train(train_data=train_df, **train_kwargs)
         else:
             model = shared_model
+            window_train_df = pd.concat(train_parts, ignore_index=True)
+            model.set_forecast_origin(window_train_df)
 
         fcst = model.forecast(test_data=test_df, type="forecast")
 
