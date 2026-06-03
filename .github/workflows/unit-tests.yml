@@ -34,7 +34,8 @@ jobs:
         python -m pip install --upgrade pip
         # Install project with all dependencies (numpy, pandas, torch from PyPI)
         python -m pip install -e ".[test]"
-        # Swap torch for CPU-only build; --no-deps keeps numpy untouched
+        # Swap torch for CPU-only build; uninstall first to avoid ABI conflicts
+        python -m pip uninstall -y torch
         python -m pip install torch --extra-index-url https://download.pytorch.org/whl/cpu --no-deps
 
     - name: Run tests with coverage
