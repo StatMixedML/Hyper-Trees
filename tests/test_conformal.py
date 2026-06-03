@@ -9,6 +9,7 @@ from hypertrees import ForecastIntervals
 from hypertrees.conformal import (
     interval_columns,
     rolling_origin_residuals,
+    _align_scores,
     _distribution_bands,
     _error_bands,
 )
@@ -38,6 +39,58 @@ def test_distribution_vs_error_bands_symmetry():
     d90 = _distribution_bands(point, scores, [90])[90]
     assert np.all(d90[0] <= d80[0] + 1e-9)  # lower bound wider
     assert np.all(d90[1] >= d80[1] - 1e-9)  # upper bound wider
+
+
+def test_align_scores_reorders_series_axis():
+    """_align_scores should permute the series axis to match target_order."""
+    # scores[:, i, :] == i so we can track where each series lands
+    scores = np.stack([np.full((2, 3), i) for i in range(3)], axis=1)  # (2, 3, 3)
+    out = _align_scores(scores, cal_order=[0, 1, 2], target_order=[2, 0, 1])
+    assert np.all(out[:, 0, :] == 2)
+    assert np.all(out[:, 1, :] == 0)
+    assert np.all(out[:, 2, :] == 1)
+
+
+def test_align_scores_noop_when_orders_match():
+    """_align_scores should return scores unchanged when orders are identical."""
+    scores = np.ones((2, 3, 3))
+    out = _align_scores(scores, cal_order=[0, 1, 2], target_order=[0, 1, 2])
+    assert out is scores
+
+
+def test_align_scores_raises_on_missing_series():
+    """_align_scores should raise if a target series wasn't calibrated."""
+    scores = np.ones((2, 2, 3))
+    with pytest.raises(ValueError, match="not seen during conformal calibration"):
+        _align_scores(scores, cal_order=[0, 1], target_order=[0, 99])
+
+
+def test_interval_columns_rejects_bad_level():
+    """interval_columns should reject levels outside (0, 100)."""
+    with pytest.raises(ValueError, match=r"level values must be in \(0, 100\)"):
+        interval_columns(
+            point=np.zeros((1, 2)),
+            scores=np.ones((3, 1, 2)),
+            levels=[100],
+            method="conformal_error",
+            model_name="M",
+            cal_order=[0],
+            target_order=[0],
+        )
+
+
+def test_interval_columns_rejects_bad_method():
+    """interval_columns should reject an unknown method."""
+    with pytest.raises(ValueError, match="method must be one of"):
+        interval_columns(
+            point=np.zeros((1, 2)),
+            scores=np.ones((3, 1, 2)),
+            levels=[90],
+            method="bogus",
+            model_name="M",
+            cal_order=[0],
+            target_order=[0],
+        )
 
 
 def test_interval_columns_naming_and_ordering():

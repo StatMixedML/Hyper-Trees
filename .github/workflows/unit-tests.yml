@@ -45,7 +45,7 @@ jobs:
       env:
         COVERAGE_CORE: pytrace
       run: |
-        pytest tests/ --cov=hypertrees.models --cov=hypertrees.utils --cov-report=xml
+        pytest tests/ --cov=hypertrees --cov-report=xml
 
     - name: Upload coverage reports to Codecov
       if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'

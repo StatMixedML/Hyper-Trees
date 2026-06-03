@@ -93,10 +93,7 @@ addopts = "--import-mode=importlib"
 
 [tool.coverage.run]
 branch = true
-source_pkgs = [
-    "hypertrees.models",
-    "hypertrees.utils",
-]
+source_pkgs = ["hypertrees"]
 
 [tool.coverage.report]
 show_missing = true
