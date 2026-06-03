@@ -35,9 +35,15 @@ jobs:
         python -m pip install -e ".[test]"
         python -m pip install --force-reinstall --no-deps torch --extra-index-url https://download.pytorch.org/whl/cpu
 
-    - name: Run tests with coverage
+    - name: Run tests
       run: |
-        pytest tests/ -vv --tb=long --cov-report=xml
+        pytest tests/ -vv --tb=long
+
+    - name: Generate coverage for Codecov
+      if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+      continue-on-error: true
+      run: |
+        pytest tests/ --cov --cov-report=xml
 
     - name: Upload coverage reports to Codecov
       if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'

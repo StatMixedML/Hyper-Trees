@@ -89,14 +89,13 @@ build-backend = "setuptools.build_meta"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# restrict to models and utils
-addopts = "--cov=hypertrees.models --cov=hypertrees.utils --cov-report=term-missing"
+addopts = "--import-mode=importlib"
 
 [tool.coverage.run]
 branch = true
-source = [
-    "hypertrees/models",
-    "hypertrees/utils.py",
+source_pkgs = [
+    "hypertrees.models",
+    "hypertrees.utils",
 ]
 
 [tool.coverage.report]
