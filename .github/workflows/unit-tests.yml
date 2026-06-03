@@ -32,10 +32,11 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        # Install CPU-only torch first (--index-url ensures no CUDA deps are pulled)
-        python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-        # Install project and remaining dependencies from PyPI (torch already satisfied)
+        # Install project and all deps from PyPI first
         python -m pip install -e ".[test]"
+        # Replace torch with CPU-only build; --no-deps avoids pulling numpy
+        # from the PyTorch index (which causes an ABI collision with PyPI numpy)
+        python -m pip install torch --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/cpu
 
     - name: Run tests with coverage
       run: |
