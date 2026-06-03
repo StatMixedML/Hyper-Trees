@@ -1,0 +1,27 @@
+Hyper-Trees
+Copyright 2026 Alexander März
+
+Licensed under the Apache License, Version 2.0, with the Commons Clause License
+Condition v1.0. See the LICENSE file for the full terms.
+
+------------------------------------------------------------------------------
+Third-party attributions
+------------------------------------------------------------------------------
+
+This product includes software adapted from the Nixtla open-source forecasting
+libraries, each licensed under the Apache License, Version 2.0:
+
+  - statsforecast    https://github.com/Nixtla/statsforecast
+  - mlforecast       https://github.com/Nixtla/mlforecast
+  - neuralforecast   https://github.com/Nixtla/neuralforecast
+
+The conformal prediction interval implementation in hypertrees/conformal.py is
+adapted from these libraries. Specifically, the rolling-origin calibration
+procedure, the two interval-construction methods ("conformal_distribution" and
+"conformal_error"), the per-horizon-step quantile logic, and the
+"<model>-lo-<level>" / "<model>-hi-<level>" output column naming convention
+follow Nixtla's design. The code has been modified from the originals.
+
+A copy of the Apache License, Version 2.0, is available at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
