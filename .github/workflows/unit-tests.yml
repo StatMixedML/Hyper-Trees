@@ -32,10 +32,10 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        # Install CPU-only torch first so pip resolves compatible numpy
-        python -m pip install torch --extra-index-url https://download.pytorch.org/whl/cpu
-        # Install project with test extras (pytest, pytest-cov, etc.)
+        # Install project with all dependencies (numpy, pandas, torch from PyPI)
         python -m pip install -e ".[test]"
+        # Swap torch for CPU-only build; --no-deps keeps numpy untouched
+        python -m pip install torch --extra-index-url https://download.pytorch.org/whl/cpu --no-deps
 
     - name: Run tests with coverage
       run: |
