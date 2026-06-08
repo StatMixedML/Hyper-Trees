@@ -1,14 +1,51 @@
-<h4 align="center">
-
-|                      | **[Release Notes](https://github.com/StatMixedML/Hyper-Trees/releases)** |
-|----------------------|---|
-| **Open&#160;Source** | [![License: Apache 2.0 + Commons Clause](https://img.shields.io/badge/License-Apache_2.0_with_Commons_Clause-yellow.svg)](LICENSE) |
-| **CI/CD**            | [![github-actions](https://img.shields.io/github/actions/workflow/status/StatMixedML/Hyper-Trees/unit-tests.yml?logo=github)](https://github.com/StatMixedML/Hyper-Trees/actions/workflows/unit-tests.yml) <img src="https://codecov.io/gh/StatMixedML/Hyper-Trees/branch/main/graph/badge.svg" alt="Code coverage status badge"> |
-| **Package**             | [![!pypi](https://img.shields.io/pypi/v/hypertrees-forecasting?color=orange)](https://pypi.org/project/hypertrees-forecasting/) [![!python-versions](https://img.shields.io/pypi/pyversions/hypertrees-forecasting)](https://www.python.org/) |
-| **Downloads**        | ![Pepy Total Downloads](https://img.shields.io/pepy/dt/hypertrees-forecasting?label=PyPI%20Downloads&color=green) |
-| **Paper**            | [![Arxiv link](https://img.shields.io/badge/arXiv-Forecasting%20with%20Hyper--Trees-color=brightgreen)](https://arxiv.org/pdf/2405.07836) |
-
-</h4>
+<table align="center" width="100%" style="border: none; border-collapse: collapse;">
+  <tr>
+    <td align="center" valign="middle" style="border: none;">
+      <h1>Hyper-Trees</h1>
+      <p><strong>GBDTs as Hyper-Models for Classical Forecasting Models</strong></p>
+      <table align="center" style="border: none; border-collapse: collapse;">
+        <tr style="border: none;">
+          <td align="left" style="border: none;"><strong>Open&nbsp;Source</strong></td>
+          <td align="center" style="border: none;">
+            <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0_with_Commons_Clause-yellow?logo=opensourceinitiative&logoColor=white" alt="License: Apache 2.0 with Commons Clause"/></a>
+          </td>
+        </tr>
+        <tr style="border: none;">
+          <td align="left" style="border: none;"><strong>CI/CD</strong></td>
+          <td align="center" style="border: none;">
+            <a href="https://github.com/StatMixedML/Hyper-Trees/actions/workflows/unit-tests.yml"><img src="https://img.shields.io/github/actions/workflow/status/StatMixedML/Hyper-Trees/unit-tests.yml?logo=github&logoColor=white&label=Build" alt="Unit Tests"/></a>
+            <a href="https://codecov.io/gh/StatMixedML/Hyper-Trees"><img src="https://img.shields.io/codecov/c/github/StatMixedML/Hyper-Trees?logo=codecov&logoColor=white&label=Coverage" alt="Code Coverage"/></a>
+          </td>
+        </tr>
+        <tr style="border: none;">
+          <td align="left" style="border: none;"><strong>Package</strong></td>
+          <td align="center" style="border: none;">
+            <a href="https://pypi.org/project/hypertrees-forecasting/"><img src="https://img.shields.io/pypi/v/hypertrees-forecasting?color=orange&logo=pypi&logoColor=white&label=PyPI" alt="PyPI Version"/></a>
+            <a href="https://www.python.org/"><img src="https://img.shields.io/pypi/pyversions/hypertrees-forecasting?logo=python&logoColor=white&label=Python" alt="Python Versions"/></a>
+          </td>
+        </tr>
+        <tr style="border: none;">
+          <td align="left" style="border: none;"><strong>Downloads</strong></td>
+          <td align="center" style="border: none;">
+            <a href="https://pepy.tech/project/hypertrees-forecasting"><img src="https://img.shields.io/pepy/dt/hypertrees-forecasting?label=PyPI%20Downloads&color=green&logo=pypi&logoColor=white" alt="PyPI Downloads"/></a>
+          </td>
+        </tr>
+        <tr style="border: none;">
+          <td align="left" style="border: none;"><strong>Paper</strong></td>
+          <td align="center" style="border: none;">
+            <a href="https://arxiv.org/abs/2405.07836"><img src="https://img.shields.io/badge/arXiv-2405.07836-b31b1b?logo=arxiv&logoColor=white&label=Paper" alt="arXiv"/></a>
+          </td>
+        </tr>
+        <tr style="border: none;">
+          <td align="left" style="border: none;"><strong>Release</strong></td>
+          <td align="center" style="border: none;">
+            <a href="https://github.com/StatMixedML/Hyper-Trees/releases"><img src="https://img.shields.io/github/v/release/StatMixedML/Hyper-Trees?logo=github&logoColor=white&label=Release%20Notes" alt="Release Notes"/></a>
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+</table>
 
 
 ---
