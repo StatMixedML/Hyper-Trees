@@ -106,7 +106,7 @@ dta["month"] = dta["date"].dt.month
 
 # Split the data into training and testing sets, reserving the last 12 months for testing
 fcst_h = 12
-test = dta.tail(fcst_h)
+test = dta.tail(fcst_h).drop(columns="value")
 train = dta.drop(test.index)
 
 # Initialize an AR-12 model for monthly data, calibrate conformal intervals, and forecast
