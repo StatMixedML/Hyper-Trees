@@ -41,6 +41,32 @@ def test_distribution_vs_error_bands_symmetry():
     assert np.all(d90[1] >= d80[1] - 1e-9)  # upper bound wider
 
 
+def test_bands_ignore_nan_scores():
+    """NaN scores (residuals at padded pseudo-observations) are excluded.
+
+    Both band methods must compute quantiles only over the non-NaN windows;
+    series without NaN scores must be unaffected.
+    """
+    rng = np.random.default_rng(0)
+    point = rng.standard_normal((2, 3))
+    scores = np.abs(rng.standard_normal((5, 2, 3)))
+
+    scores_nan = scores.copy()
+    scores_nan[0, 0, :] = np.nan  # series 0: first calibration window is padding
+
+    for fn in (_error_bands, _distribution_bands):
+        lo, hi = fn(point, scores_nan, [90])[90]
+        assert np.isfinite(lo).all() and np.isfinite(hi).all()
+        # series 1 (no NaNs) is unaffected
+        ref_lo, ref_hi = fn(point, scores, [90])[90]
+        np.testing.assert_allclose(lo[1], ref_lo[1])
+        np.testing.assert_allclose(hi[1], ref_hi[1])
+        # series 0 equals the bands computed from the remaining windows only
+        red_lo, red_hi = fn(point[[0]], scores[1:, [0], :], [90])[90]
+        np.testing.assert_allclose(lo[0], red_lo[0])
+        np.testing.assert_allclose(hi[0], red_hi[0])
+
+
 def test_align_scores_reorders_series_axis():
     """_align_scores should permute the series axis to match target_order."""
     # scores[:, i, :] == i so we can track where each series lands
@@ -155,3 +181,44 @@ def test_refit_false_calls_set_forecast_origin():
     assert scores.shape == (n_windows, n_series, fcst_h)
     # residuals should all be 0.5 (our fake_forecast adds 0.5)
     np.testing.assert_allclose(scores, 0.5)
+
+
+def test_rolling_origin_residuals_masks_padded_rows():
+    """Residuals at padded rows (mask == 0) must be NaN in the scores."""
+    T, fcst_h = 12, 3
+    dates = pd.date_range("2020-01-01", periods=T, freq="MS")
+    train_data = pd.DataFrame({
+        "series_id": 0,
+        "date": dates,
+        "value": np.arange(T, dtype=float),
+        "mask": [1] * (T - 2) + [0, 0],  # last two rows are padding
+    })
+
+    mock_model = MagicMock()
+
+    def fake_forecast(test_data, type="forecast"):
+        return pd.DataFrame({
+            "series_id": test_data["series_id"].values,
+            "date": test_data["date"].values,
+            "fcst": test_data["value"].values + 0.5,
+            "model": "mock",
+        })
+
+    mock_model.forecast = MagicMock(side_effect=fake_forecast)
+    mock_model.train = MagicMock()
+
+    pi = ForecastIntervals(n_windows=2, step_size=1, refit=True)
+    scores, _ = rolling_origin_residuals(
+        model_factory=lambda: mock_model,
+        train_data=train_data,
+        fcst_h=fcst_h,
+        forecast_intervals=pi,
+        train_kwargs={},
+    )
+
+    # Window 0 tests the last 3 rows: positions 1 and 2 are padding -> NaN
+    np.testing.assert_allclose(scores[0, 0, 0], 0.5)
+    assert np.isnan(scores[0, 0, 1]) and np.isnan(scores[0, 0, 2])
+    # Window 1 tests rows T-4..T-2: only the last is padding -> NaN
+    np.testing.assert_allclose(scores[1, 0, :2], 0.5)
+    assert np.isnan(scores[1, 0, 2])

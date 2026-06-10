@@ -29,14 +29,14 @@ class TestHyperTreeARInitialization:
         
     def test_custom_initialization(self):
         """Test model initialization with custom parameters."""
-        loss_fn = nn.L1Loss()
+        loss_fn = nn.HuberLoss()
         model = HyperTreeAR(p=5, freq="D", fcst_h=3, loss_fn=loss_fn)
         
         assert model.p == 5
         assert model.freq == "D"
         assert model.fcst_h == 3
         assert model.loss_fn == loss_fn
-        assert model.loss_name == "L1Loss"
+        assert model.loss_name == "HuberLoss"
         
     def test_invalid_p_parameter(self):
         """Test that invalid p parameter raises ValueError."""
@@ -70,20 +70,34 @@ class TestHyperTreeARInitialization:
         assert hasattr(model, '_gn_hessian')
 
     def test_default_hessian_method(self):
-        """Test that default hessian method is exact."""
+        """Test that the default hessian method is the analytic fast path."""
         model = HyperTreeAR()
-        assert model.hessian_method == "exact"
+        assert model.hessian_method == "analytic"
         assert not hasattr(model, '_gn_hessian')
 
     def test_invalid_hessian_method(self):
         """Test that invalid hessian_method raises ValueError."""
-        with pytest.raises(ValueError, match="hessian_method must be either 'exact' or 'gn'"):
+        with pytest.raises(ValueError, match="hessian_method must be one of 'exact', 'analytic', or 'gn'"):
             HyperTreeAR(hessian_method="invalid")
+
+    def test_analytic_hessian_initialization(self):
+        """Test model initialization with the analytic hessian method."""
+        model = HyperTreeAR(hessian_method="analytic")
+        assert model.hessian_method == "analytic"
+        assert not hasattr(model, '_gn_hessian')
+        assert model.calculate_gradients_and_hessians == model._calculate_gradients_and_hessians_analytic
 
     def test_gn_hessian_warning_non_mse(self):
         """Test that warning is issued for non-MSE loss with GN."""
         with pytest.warns(UserWarning, match="not nn.MSELoss"):
-            HyperTreeAR(hessian_method="gn", loss_fn=nn.L1Loss())
+            HyperTreeAR(hessian_method="gn", loss_fn=nn.HuberLoss())
+
+    def test_l1_loss_rejected(self):
+        """nn.L1Loss must be rejected: its second derivative is zero almost
+        everywhere, so Newton boosting would receive all-zero Hessians and
+        could not grow trees."""
+        with pytest.raises(ValueError, match="L1Loss is not supported"):
+            HyperTreeAR(loss_fn=nn.L1Loss())
 
     def test_invalid_freq_type(self):
         """Test that non-string freq raises TypeError."""
@@ -498,8 +512,15 @@ class TestHyperTreeARInternalMethods:
         # Check that parameters require gradients
         assert params.requires_grad
             
-    def test_calculate_gradients_and_hessians(self, model):
-        """Test gradient and hessian calculation."""
+    def test_calculate_gradients_and_hessians(self):
+        """Test gradient and hessian calculation (exact autograd path).
+
+        Uses an explicit hessian_method="exact" model: only the exact path can
+        differentiate a hand-built loss; "analytic" (the default) relies on
+        the fit/target/lags stored by get_params_loss.
+        """
+        model = HyperTreeAR(p=2, hessian_method="exact")
+
         # Create parameters that require gradients
         params = torch.randn(5, 2, requires_grad=True)
 
@@ -1148,7 +1169,7 @@ class TestHyperTreeAREvalFunction:
         """Test eval_fn with different loss functions."""
         loss_functions = [
             (nn.MSELoss(), "MSELoss"),
-            (nn.L1Loss(), "L1Loss"),
+            (nn.HuberLoss(), "HuberLoss"),
             (nn.SmoothL1Loss(), "SmoothL1Loss")
         ]
 
@@ -1306,3 +1327,79 @@ class TestHyperTreeARConformal:
         model, _, test = calibrated
         with pytest.raises(ValueError):
             model.forecast(test_data=test, level=[150])
+
+
+class TestHyperTreeARAnalyticHessian:
+    """Tests for hessian_method='analytic' (closed-form via model linearity)."""
+
+    @staticmethod
+    def _grad_hess(method, loss_fn, predt, target, lags, p):
+        """Run one objective-style grad/hess computation with the given method."""
+        model = HyperTreeAR(p=p, loss_fn=loss_fn, hessian_method=method)
+        params, loss = model.get_params_loss(predt, target, lags, requires_grad=True)
+        return model.calculate_gradients_and_hessians(loss, params)
+
+    def test_analytic_matches_exact_across_losses(self):
+        """Analytic grad/hess must equal the autograd 'exact' path.
+
+        Covers the MSE fast path (no autograd) and the generic
+        double-backward path (Huber, SmoothL1).
+        """
+        torch.manual_seed(0)
+        n, p = 40, 3
+        rng = np.random.default_rng(0)
+        predt = rng.standard_normal(n * p)
+        lags = torch.randn(n, p)
+        target = torch.randn(n, 1) * 5
+
+        for loss_fn in [nn.MSELoss(), nn.HuberLoss(), nn.SmoothL1Loss()]:
+            g_exact, h_exact = self._grad_hess("exact", loss_fn, predt.copy(), target, lags, p)
+            g_analytic, h_analytic = self._grad_hess("analytic", loss_fn, predt.copy(), target, lags, p)
+            np.testing.assert_allclose(
+                g_analytic, g_exact, rtol=1e-5, atol=1e-7,
+                err_msg=f"gradient mismatch for {type(loss_fn).__name__}",
+            )
+            np.testing.assert_allclose(
+                h_analytic, h_exact, rtol=1e-5, atol=1e-7,
+                err_msg=f"hessian mismatch for {type(loss_fn).__name__}",
+            )
+
+    def test_analytic_matches_exact_sum_reduction(self):
+        """The MSE fast path must honor reduction='sum' as well."""
+        n, p = 25, 2
+        rng = np.random.default_rng(1)
+        predt = rng.standard_normal(n * p)
+        lags = torch.randn(n, p)
+        target = torch.randn(n, 1)
+
+        loss_fn = nn.MSELoss(reduction="sum")
+        g_exact, h_exact = self._grad_hess("exact", loss_fn, predt.copy(), target, lags, p)
+        g_analytic, h_analytic = self._grad_hess("analytic", loss_fn, predt.copy(), target, lags, p)
+        np.testing.assert_allclose(g_analytic, g_exact, rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(h_analytic, h_exact, rtol=1e-5, atol=1e-6)
+
+    def test_train_and_forecast_with_analytic(self):
+        """End-to-end training with hessian_method='analytic' works."""
+        n = 30
+        dates = pd.date_range("2020-01-01", periods=n, freq="D")
+        train = pd.DataFrame({
+            "series_id": "S1",
+            "date": dates,
+            "value": 100 + 10 * np.sin(np.arange(n) / 3),
+            "dow": dates.dayofweek.astype(float),
+        })
+        test = pd.DataFrame({
+            "series_id": "S1",
+            "date": pd.date_range(dates[-1] + pd.Timedelta(days=1), periods=2, freq="D"),
+            "dow": [0.0, 1.0],
+        })
+
+        model = HyperTreeAR(p=2, freq="D", fcst_h=2, hessian_method="analytic")
+        model.train(
+            lgb_params={"learning_rate": 0.1, "min_data_in_leaf": 2},
+            num_iterations=5,
+            train_data=train,
+        )
+        out = model.forecast(test_data=test)
+        assert len(out) == 2
+        assert np.isfinite(out["fcst"]).all()

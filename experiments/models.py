@@ -12,6 +12,7 @@ from hypertrees.models import (
     HyperTreeNetAR,
 )
 from hypertrees.models.mlp import MLP
+from hypertrees.utils import NoDeepcopyObjective
 from sklearn.preprocessing import StandardScaler
 
 from chronos import ChronosPipeline
@@ -921,13 +922,16 @@ def HyperTreeETSForecast(
             season_length=htets_params["season_length"],
             freq=freq,
             fcst_h=fcst_h,
-            loss_fn=loss_fn
+            loss_fn=loss_fn,
+            # Experiments reproduce the paper benchmarks, which were produced
+            # with the pre-0.2.0 state initialization.
+            seasonal_init=htets_params.get("seasonal_init", "legacy"),
         )
 
         # Train model
         if manual_param is None:
             ht_ets.train(
-                lgb_params={k: v for k, v in htets_params.items() if k not in ["num_boost_round", "season_length", "ets_type", "manual_param", "scaling", "train"]},
+                lgb_params={k: v for k, v in htets_params.items() if k not in ["num_boost_round", "season_length", "ets_type", "manual_param", "scaling", "train", "seasonal_init"]},
                 num_iterations=htets_params["num_boost_round"],
                 train_data=train[["series_id", "date", "value"] + features],
                 seed=123,
@@ -1389,7 +1393,6 @@ class HyperTreeNetDirectForecasting:
         message="Using backward\\(\\) with create_graph=True will create a reference cycle.*"
     )
 
-    _network_states = {}  # Store network states for each instance
     def __init__(
             self,
             freq: str = "M",
@@ -1482,9 +1485,6 @@ class HyperTreeNetDirectForecasting:
         self.optimizer.zero_grad()
         network_loss.backward()
         self.optimizer.step()
-
-        # Store network state
-        HyperTreeNetDirectForecasting._network_states = self.network.state_dict()
 
         # Calculate loss for GBDT
         self.network.eval()
@@ -1580,10 +1580,11 @@ class HyperTreeNetDirectForecasting:
         ).to(self.device)
         self.optimizer = torch.optim.Adam(self.network.parameters(), lr=network_params["learning_rate"])
 
-        # GBDT parameters
+        # GBDT parameters. The objective wrapper stops lgb.train's params
+        # deepcopy from cloning this instance (see NoDeepcopyObjective).
         self.lgb_params = {
             "num_class": self.embedding_dim,
-            "objective": self.objective_fn,
+            "objective": NoDeepcopyObjective(self.objective_fn),
             "metric": "None",
             "random_seed": seed,
             "verbose": verbose
@@ -1639,9 +1640,8 @@ class HyperTreeNetDirectForecasting:
             device=self.device
         ).reshape(-1, self.embedding_dim)
 
-        # Load saved network state
-        self.network.load_state_dict(HyperTreeNetDirectForecasting._network_states)
-
+        # self.network holds this instance's trained weights (boosting
+        # updated it in place; see NoDeepcopyObjective).
         self.network.eval()
         with torch.no_grad():
             forecasts = (self.network(gbdt_embeds)

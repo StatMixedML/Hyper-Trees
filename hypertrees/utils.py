@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Optional, Any, Tuple
+from typing import Callable, List, Dict, Optional, Any, Tuple
 import torch
 import torch.nn as nn
 from torch.autograd import grad as autograd
@@ -86,14 +86,46 @@ def validate_series_order(data: pd.DataFrame, name: str = "data") -> None:
             f"`{name} = {name}.sort_values(['series_id', 'date']).reset_index(drop=True)`."
         )
 
-    # Check 2: within each series, `date` must be strictly increasing.
+    # Check 2: within each series, `date` must be strictly increasing
+    # (monotonic AND free of duplicates -- is_monotonic_increasing alone is
+    # non-strict and would let duplicate dates through).
     for series_id, group in data.groupby("series_id", sort=False):
-        if not pd.to_datetime(group["date"]).is_monotonic_increasing:
+        dates = pd.to_datetime(group["date"])
+        if not (dates.is_monotonic_increasing and dates.is_unique):
             raise ValueError(
                 f"{name}: 'date' is not strictly increasing within series "
-                f"'{series_id}'. Fix with "
-                f"`{name} = {name}.sort_values(['series_id', 'date']).reset_index(drop=True)`."
+                f"'{series_id}' (out-of-order or duplicate dates). Sort with "
+                f"`{name} = {name}.sort_values(['series_id', 'date']).reset_index(drop=True)` "
+                f"and remove or aggregate duplicate dates."
             )
+
+class NoDeepcopyObjective:
+    """Keep a custom LightGBM objective bound to the live model instance.
+
+    ``lgb.train`` deep-copies its ``params`` dict before extracting a callable
+    objective, so a bound method would be cloned together with its whole model
+    instance and boosting would train that hidden copy. This wrapper survives
+    ``deepcopy``/``copy`` by reference, keeping the objective pointed at the
+    original, live model.
+
+    Parameters
+    ----------
+    fn : Callable
+        The objective callable (typically ``self.objective_fn``).
+    """
+
+    def __init__(self, fn: Callable):
+        self._fn = fn
+
+    def __call__(self, *args, **kwargs):
+        return self._fn(*args, **kwargs)
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __copy__(self):
+        return self
+
 
 class CustomLogger:
     def __init__(self):
@@ -439,7 +471,20 @@ class GaussNewtonHessian:
             self.estimate = self._general
 
     def _compute_loss_curvature(self, fit: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Per-element d^2L/d(y_hat)^2 via autograd."""
+        """Per-element d^2L/d(y_hat)^2 via autograd.
+
+        Parameters
+        ----------
+        fit : torch.Tensor
+            Fitted values.
+        target : torch.Tensor
+            Target values, same shape as ``fit``.
+
+        Returns
+        -------
+        torch.Tensor
+            Detached per-element loss curvature, same shape as ``fit``.
+        """
         fit_leaf = fit.detach().requires_grad_(True)
         loss_local = self.loss_fn(fit_leaf, target.detach())
         grad1 = autograd(loss_local, fit_leaf, create_graph=True)[0]
@@ -453,7 +498,24 @@ class GaussNewtonHessian:
         params: torch.Tensor,
         rng: torch.Generator,
     ) -> torch.Tensor:
-        """Hutchinson diagonal Hessian for MSELoss (constant curvature B = 2/N)."""
+        """Hutchinson diagonal Hessian for MSELoss (constant curvature B = 2/N).
+
+        Parameters
+        ----------
+        fit : torch.Tensor
+            Fitted values (graph-connected to ``params``).
+        target : torch.Tensor
+            Target values (unused for MSE; curvature is constant).
+        params : torch.Tensor
+            Parameters w.r.t. which the Hessian diagonal is estimated.
+        rng : torch.Generator
+            Seeded generator for the Gaussian probe vectors.
+
+        Returns
+        -------
+        torch.Tensor
+            Estimated Hessian diagonal, same shape as ``params``.
+        """
         N = fit.numel()
         hess_sum = torch.zeros_like(params)
         for _ in range(self.n_probes):
@@ -469,7 +531,24 @@ class GaussNewtonHessian:
         params: torch.Tensor,
         rng: torch.Generator,
     ) -> torch.Tensor:
-        """Hutchinson diagonal Hessian for arbitrary twice-differentiable losses."""
+        """Hutchinson diagonal Hessian for arbitrary twice-differentiable losses.
+
+        Parameters
+        ----------
+        fit : torch.Tensor
+            Fitted values (graph-connected to ``params``).
+        target : torch.Tensor
+            Target values, same shape as ``fit``.
+        params : torch.Tensor
+            Parameters w.r.t. which the Hessian diagonal is estimated.
+        rng : torch.Generator
+            Seeded generator for the Gaussian probe vectors.
+
+        Returns
+        -------
+        torch.Tensor
+            Estimated Hessian diagonal, same shape as ``params``.
+        """
         loss_curv = self._compute_loss_curvature(fit, target)
         sqrt_curv = loss_curv.clamp(min=0.0).sqrt()
         hess_sum = torch.zeros_like(params)

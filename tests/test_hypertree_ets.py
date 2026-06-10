@@ -894,3 +894,187 @@ class TestHyperTreeETSConformal:
         model.train(lgb_params=self.LGB_PARAMS, num_iterations=20, train_data=train)
         with pytest.raises(RuntimeError, match="not calibrated"):
             model.forecast(test_data=test, level=[90])
+
+
+class TestInitTripleStates:
+    """Tests for the decomposition-based state initialization (statsforecast-style)."""
+
+    def test_l1_loss_rejected(self):
+        """nn.L1Loss is rejected: zero curvature yields all-zero Hessians."""
+        with pytest.raises(ValueError, match="L1Loss is not supported"):
+            HyperTreeETS(
+                ets_type="triple", season_length=4, seasonality_feature="month",
+                loss_fn=nn.L1Loss(),
+            )
+
+    def test_seasonal_init_default_and_validation(self):
+        """Default is 'classical'; invalid values raise."""
+        model = HyperTreeETS(
+            ets_type="triple", season_length=4, seasonality_feature="month"
+        )
+        assert model.seasonal_init == "classical"
+
+        legacy = HyperTreeETS(
+            ets_type="triple", season_length=4, seasonality_feature="month",
+            seasonal_init="legacy",
+        )
+        assert legacy.seasonal_init == "legacy"
+
+        with pytest.raises(ValueError, match="seasonal_init must be either"):
+            HyperTreeETS(
+                ets_type="triple", season_length=4, seasonality_feature="month",
+                seasonal_init="bogus",
+            )
+
+    def test_legacy_init_reproduces_pre_020_formula(self):
+        """seasonal_init='legacy' must match the pre-0.2.0 code verbatim,
+        so earlier results (incl. the paper benchmarks) stay reproducible."""
+        m, cycles = 4, 5
+        T = m * cycles
+        torch.manual_seed(3)
+        y = 100.0 + torch.rand(1, T) * 50.0
+        mask = torch.ones_like(y)
+        slots = (torch.arange(T) % m).view(1, -1)
+
+        model = HyperTreeETS(
+            ets_type="triple", season_length=m, seasonality_feature="month",
+            seasonal_init="legacy",
+        )
+        model.n_series = 1
+        seasonality, level0, trend0 = model._init_triple_states(y, mask, slots)
+
+        # Reference: the original (pre-0.2.0) implementation, replicated verbatim
+        init_len = min(m, T)
+        seasonal_avg = torch.zeros((1, init_len))
+        for i in range(init_len):
+            valid_obs = mask[:, i::init_len]
+            seasonal_avg[:, i] = (y[:, i::init_len] * valid_obs.float()).sum(
+                1) / valid_obs.float().sum(1).clamp(min=1)
+        ref_seasonality = y[:, :init_len] / (seasonal_avg + model.eps)
+        ref_season_adj = y[:, :init_len] / ref_seasonality[:, :init_len]
+
+        torch.testing.assert_close(seasonality, ref_seasonality)
+        torch.testing.assert_close(level0, ref_season_adj[:, 0])
+        torch.testing.assert_close(trend0, ref_season_adj[:, 1] - ref_season_adj[:, 0])
+
+    def test_recovers_seasonality_and_trend_with_offset_start(self):
+        """The init must recover the seasonal shape under a linear trend,
+        with correct slot alignment for a series starting mid-season.
+
+        The old positional init both cancelled the seasonal shape and, even
+        when shape-preserving, rotated the profile for series not starting
+        at season position 1.
+        """
+        m, cycles = 4, 6
+        T = m * cycles
+        S = torch.tensor([0.8, 1.2, 1.1, 0.9])  # mean exactly 1.0
+        start_offset = 1  # series starts at season position 2 (slot index 1)
+        slots = (start_offset + torch.arange(T)) % m
+        trend = 10.0 + 0.5 * torch.arange(T, dtype=torch.float32)
+        y = (trend * S[slots]).view(1, -1)
+        mask = torch.ones_like(y)
+
+        model = HyperTreeETS(
+            ets_type="triple", season_length=m, seasonality_feature="month"
+        )
+        model.n_series = 1
+
+        seasonality, level0, trend0 = model._init_triple_states(
+            y, mask, slots.view(1, -1)
+        )
+
+        # Seasonal shape recovered in SLOT order despite trend and offset start
+        assert seasonality.shape == (1, m)
+        torch.testing.assert_close(seasonality[0], S, atol=0.05, rtol=0.0)
+        # OLS seeds: slope ~ 0.5, level ~ value of the trend line at t = 1
+        assert abs(trend0.item() - 0.5) < 0.1
+        assert abs(level0.item() - 10.5) < 0.5
+
+    def test_short_series_falls_back_without_crash(self):
+        """Series shorter than the MA kernel use the simple per-slot fallback."""
+        m = 12
+        model = HyperTreeETS(
+            ets_type="triple", season_length=m, seasonality_feature="month"
+        )
+        model.n_series = 1
+        for T in [1, 3, 6]:
+            y = 100.0 + torch.arange(T, dtype=torch.float32).view(1, -1)
+            mask = torch.ones_like(y)
+            slots = (torch.arange(T) % m).view(1, -1)
+            seasonality, level0, trend0 = model._init_triple_states(y, mask, slots)
+            assert seasonality.shape == (1, m)
+            assert torch.isfinite(seasonality).all()
+            assert (seasonality > 0).all()
+            assert torch.isfinite(level0).all() and torch.isfinite(trend0).all()
+
+    def test_init_cached_per_dataset(self):
+        """The init must compute once per dataset, not once per boosting iteration.
+
+        Cache hits must return the pristine initialization even though the
+        recursion mutates the returned seasonality tensor in place.
+        """
+        m, cycles = 4, 6
+        T = m * cycles
+        y = (100.0 + torch.arange(T, dtype=torch.float32)).view(1, -1)
+        mask = torch.ones_like(y)
+        slots = (torch.arange(T) % m).view(1, -1)
+
+        model = HyperTreeETS(
+            ets_type="triple", season_length=m, seasonality_feature="month"
+        )
+        model.n_series = 1
+
+        calls = {"n": 0}
+        orig = model._init_triple_states
+
+        def counting(*args, **kwargs):
+            calls["n"] += 1
+            return orig(*args, **kwargs)
+
+        model._init_triple_states = counting
+
+        data_a, data_b = object(), object()  # only identity is used as cache key
+
+        s1, l1, t1 = model._cached_init_triple_states(data_a, y, mask, slots)
+        s2, l2, t2 = model._cached_init_triple_states(data_a, y, mask, slots)
+        assert calls["n"] == 1  # second call is a cache hit
+        torch.testing.assert_close(s1, s2)
+        torch.testing.assert_close(l1, l2)
+        torch.testing.assert_close(t1, t2)
+
+        # In-place mutation of a returned tensor must not poison the cache
+        s1[0, 0] = 123.0
+        s3, _, _ = model._cached_init_triple_states(data_a, y, mask, slots)
+        assert calls["n"] == 1
+        assert s3[0, 0].item() != 123.0
+
+        # A different dataset object recomputes
+        model._cached_init_triple_states(data_b, y, mask, slots)
+        assert calls["n"] == 2
+
+        # Entries pin their dataset object, so a key hit can only come from
+        # that exact, still-alive dataset (ids of live objects are unique).
+        assert model._init_cache[id(data_a)]["data"] is data_a
+
+    def test_padded_rows_do_not_distort_indices(self):
+        """Masked (padded) observations must not contribute to the init."""
+        m, cycles = 4, 5
+        T_real = m * cycles
+        pad_len = 6
+        S = torch.tensor([0.8, 1.2, 1.1, 0.9])
+        slots_real = torch.arange(T_real) % m
+        y_real = 50.0 * S[slots_real]
+
+        # Back-append garbage values that the mask flags as padding
+        y = torch.cat([y_real, torch.full((pad_len,), 9999.0)]).view(1, -1)
+        mask = torch.cat([torch.ones(T_real), torch.zeros(pad_len)]).view(1, -1)
+        slots = (torch.arange(T_real + pad_len) % m).view(1, -1)
+
+        model = HyperTreeETS(
+            ets_type="triple", season_length=m, seasonality_feature="month"
+        )
+        model.n_series = 1
+        seasonality, level0, _ = model._init_triple_states(y, mask, slots)
+
+        torch.testing.assert_close(seasonality[0], S, atol=0.05, rtol=0.0)
+        assert abs(level0.item() - 50.0) < 2.5

@@ -6,7 +6,7 @@ from torch.autograd import grad as autograd
 import lightgbm as lgb
 from typing import Tuple, Callable, Optional, List
 import time
-from ..utils import TimeSeriesPreprocessor, prepare_datasets, TrainingResult, CustomLogger, validate_series_order, extract_forecast_lags, GaussNewtonHessian
+from ..utils import TimeSeriesPreprocessor, prepare_datasets, TrainingResult, CustomLogger, validate_series_order, extract_forecast_lags, GaussNewtonHessian, NoDeepcopyObjective
 from ..conformal import (
     ForecastIntervals,
     validate_calibration_length,
@@ -108,7 +108,6 @@ class HyperTreeNetAR:
     plt.tight_layout()
     ```
     """
-    _network_states = {}  # Store network states for each instance
     def __init__(
             self,
             p: int = 2,
@@ -133,7 +132,10 @@ class HyperTreeNetAR:
             Forecast horizon (number of periods to forecast ahead).
         loss_fn : Callable
             Loss function for optimization. Must be a PyTorch loss function.
-            Default is MSE loss, but can be changed for different error metrics.
+            Default is MSE loss. Losses other than nn.MSELoss are not
+            recommended, as they have not been systematically tested yet.
+            nn.L1Loss is rejected (zero second derivative almost everywhere
+            breaks Newton boosting).
         device : str
             Device to run the model on. Default is 'cpu'.
             This allows for GPU acceleration of network training if available.
@@ -157,6 +159,13 @@ class HyperTreeNetAR:
             raise TypeError("freq must be a string.")
         if not isinstance(loss_fn, nn.Module):
             raise TypeError("loss_fn must be a PyTorch loss function.")
+        if isinstance(loss_fn, nn.L1Loss):
+            raise ValueError(
+                "nn.L1Loss is not supported: its second derivative is zero almost "
+                "everywhere, so LightGBM's Newton boosting receives all-zero Hessians "
+                "and cannot grow trees. Use nn.HuberLoss or nn.SmoothL1Loss for an "
+                "MAE-like loss with usable curvature."
+            )
         if hessian_method not in ("exact", "gn"):
             raise ValueError("hessian_method must be either 'exact' or 'gn'.")
         if not isinstance(n_hessian_probes, int) or n_hessian_probes <= 0:
@@ -265,8 +274,8 @@ class HyperTreeNetAR:
             dtype=self.dtype
         ).to(self.device)
 
-        # Load the most recent network state
-        self.network.load_state_dict(HyperTreeNetAR._network_states)
+        # self.network is the live module the objective updated in this same
+        # boosting iteration (guaranteed by NoDeepcopyObjective).
 
         # Compute loss without gradients
         self.network.eval()
@@ -327,9 +336,6 @@ class HyperTreeNetAR:
         self.optimizer.zero_grad()
         network_loss.backward()
         self.optimizer.step()
-
-        # Store network state
-        HyperTreeNetAR._network_states = self.network.state_dict()
 
         # Calculate loss for GBDT
         self.network.eval()
@@ -457,7 +463,20 @@ class HyperTreeNetAR:
 
 
     def _calculate_gradients_and_hessians_separate_gn(self, loss: torch.Tensor, embeds: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
-        """Gauss-Newton Hessian for separate gradient mode via Hutchinson probing."""
+        """Gauss-Newton Hessian for separate gradient mode via Hutchinson probing.
+
+        Parameters
+        ----------
+        loss : torch.Tensor
+            Loss value from the model.
+        embeds : torch.Tensor
+            GBDT embeddings, shape ``(n_samples, embedding_dim)``.
+
+        Returns
+        -------
+        Tuple[np.ndarray, np.ndarray]
+            Gradients and hessians as numpy arrays in the format expected by LightGBM.
+        """
         grad = autograd(loss, inputs=embeds, retain_graph=True)[0]
         rng = torch.Generator().manual_seed(self._iter_count)
         hess = self._gn_hessian.estimate(self._fit, self._target, embeds, rng)
@@ -500,9 +519,6 @@ class HyperTreeNetAR:
         # Update network parameters
         self.optimizer.step()
 
-        # Store network state
-        HyperTreeNetAR._network_states = self.network.state_dict()
-
         # Clear existing gradients to prevent accumulation
         embeds.grad = None
         self.optimizer.zero_grad()
@@ -510,7 +526,21 @@ class HyperTreeNetAR:
         return grad, hess
 
     def _calculate_gradients_and_hessians_shared_gn(self, loss: torch.Tensor, embeds: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
-        """Gauss-Newton Hessian for shared gradient mode via Hutchinson probing."""
+        """Gauss-Newton Hessian for shared gradient mode via Hutchinson probing.
+
+        Parameters
+        ----------
+        loss : torch.Tensor
+            Loss value from the model (already backpropagated by
+            ``get_embeds_loss_shared``, which populates ``embeds.grad``).
+        embeds : torch.Tensor
+            GBDT embeddings, shape ``(n_samples, embedding_dim)``.
+
+        Returns
+        -------
+        Tuple[np.ndarray, np.ndarray]
+            Gradients and hessians as numpy arrays in the format expected by LightGBM.
+        """
         grad = embeds.grad
         rng = torch.Generator().manual_seed(self._iter_count)
         hess = self._gn_hessian.estimate(self._fit, self._target, embeds, rng)
@@ -519,7 +549,6 @@ class HyperTreeNetAR:
         grad = grad.cpu().detach().numpy().ravel(order="F")
         hess = hess.cpu().detach().numpy().ravel(order="F")
         self.optimizer.step()
-        HyperTreeNetAR._network_states = self.network.state_dict()
         embeds.grad = None
         self.optimizer.zero_grad()
 
@@ -658,6 +687,11 @@ class HyperTreeNetAR:
         gbdt_params = lgb_params.copy()
         self.embedding_dim = network_params["embedding_dimension"]
 
+        # Seed torch before constructing the MLP so initialization (and dropout
+        # draws during training) are reproducible even when the random
+        # projection layer -- whose constructor reseeds torch -- is disabled.
+        torch.manual_seed(seed)
+
         self.network = MLP(
             tree_embed_dim=self.embedding_dim,
             output_dim=self.p,
@@ -696,10 +730,11 @@ class HyperTreeNetAR:
             else:
                 self.calculate_gradients_and_hessians = self._calculate_gradients_and_hessians_shared_gn
 
-        # GBDT parameters
+        # GBDT parameters. The objective wrapper stops lgb.train's params
+        # deepcopy from cloning this instance (see NoDeepcopyObjective).
         self.lgb_params = {
             "num_class": self.embedding_dim,
-            "objective": self.objective_fn,
+            "objective": NoDeepcopyObjective(self.objective_fn),
             "metric": "None",
             "random_seed": seed,
             "verbose": verbose
@@ -941,8 +976,8 @@ class HyperTreeNetAR:
                 device=self.device
             ).reshape(-1, self.embedding_dim)
 
-            # Load saved network state
-            self.network.load_state_dict(HyperTreeNetAR._network_states)
+            # self.network holds this instance's trained weights (boosting
+            # updated it in place; see NoDeepcopyObjective).
             self.network.eval()
 
             if type == "forecast":

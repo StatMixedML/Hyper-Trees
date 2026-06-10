@@ -10,7 +10,7 @@ import random
 from ..utils import CustomLogger
 lgb.register_logger(CustomLogger())
 
-from ..utils import TimeSeriesPreprocessor, prepare_datasets, TrainingResult, validate_series_order, GaussNewtonHessian
+from ..utils import TimeSeriesPreprocessor, prepare_datasets, TrainingResult, validate_series_order, GaussNewtonHessian, NoDeepcopyObjective
 from ..conformal import (
     ForecastIntervals,
     validate_calibration_length,
@@ -98,6 +98,7 @@ class HyperTreeETS:
             fcst_h: int = 12,
             loss_fn: Callable = nn.MSELoss(),
             n_hessian_probes: int = 5,
+            seasonal_init: str = "classical",
     ):
         """
         Initialize the Hyper-Tree-ETS model.
@@ -111,7 +112,8 @@ class HyperTreeETS:
         seasonality_feature : str
             Feature name for seasonality. This is used to create seasonal indices. Must be present in the dataset.
             For example, "month" for monthly data, "quarter" for quarterly data, etc. This is required when
-            ets_type is "triple".
+            ets_type is "triple". Values must be 1-based season positions in [1, season_length];
+            shift 0-based features (e.g. pandas dayofweek in 0..6) by +1.
         freq : str
             Frequency of the time series (e.g., 'D' for daily, 'M' for monthly,
             'Q' for quarterly, 'Y' for yearly).
@@ -119,16 +121,27 @@ class HyperTreeETS:
             Forecast horizon (number of periods to forecast ahead).
         loss_fn : Callable
             Loss function for optimization. Must be a PyTorch loss function.
-            Default is MSE loss. Must be twice-differentiable for the
-            Gauss-Newton Hessian; non-smooth losses (e.g., L1Loss) have
-            zero or undefined second derivatives, causing degenerate Hessians.
+            Default is MSE loss. Losses other than nn.MSELoss are not
+            recommended, as they have not been systematically tested yet.
+            nn.L1Loss is rejected (zero second derivative almost everywhere
+            breaks Newton boosting).
         n_hessian_probes : int
             Number of Hutchinson probes for Gauss-Newton Hessian diagonal estimation.
             More probes reduce variance but increase computation. Default is 5.
+        seasonal_init : str
+            Initialization of the seasonal/level/trend states for the triple
+            ETS forward pass (ignored for ets_type="trend"). Options:
+            - "classical" (default): decomposition-based estimator following
+              R's forecast::ets and statsforecast (centered 2 x m moving-average
+              detrending, slot-aligned seasonal indices, OLS level/trend seed).
+            - "legacy": the exact pre-0.2.0 initialization, kept verbatim for
+              reproducing earlier results (including the paper benchmarks).
         """
         # Validate inputs
         if ets_type not in ["triple", "trend"]:
             raise ValueError("ets_type must be either 'triple' or 'trend'.")
+        if seasonal_init not in ["classical", "legacy"]:
+            raise ValueError("seasonal_init must be either 'classical' or 'legacy'.")
         if season_length <= 0:
             raise ValueError("season_length must be a positive integer.")
         if not isinstance(season_length, int):
@@ -137,6 +150,13 @@ class HyperTreeETS:
             raise ValueError("Forecast horizon 'fcst_h' must be a positive integer.")
         if not isinstance(loss_fn, nn.Module):
             raise TypeError("loss_fn must be a PyTorch loss function.")
+        if isinstance(loss_fn, nn.L1Loss):
+            raise ValueError(
+                "nn.L1Loss is not supported: its second derivative is zero almost "
+                "everywhere, so LightGBM's Newton boosting receives all-zero Hessians "
+                "and cannot grow trees. Use nn.HuberLoss or nn.SmoothL1Loss for an "
+                "MAE-like loss with usable curvature."
+            )
         if not isinstance(loss_fn, nn.MSELoss):
             import warnings
             warnings.warn(
@@ -154,6 +174,7 @@ class HyperTreeETS:
         self.ets_type = ets_type
         self.season_length = season_length
         self.seasonality_feature = seasonality_feature
+        self.seasonal_init = seasonal_init
         self.freq = freq
         self.n_params = 4 if ets_type == "triple" else 2  # alpha, beta, gamma, phi OR alpha, beta
         self.fcst_h = fcst_h
@@ -168,6 +189,7 @@ class HyperTreeETS:
         self.fcst_states = None         # Store final ETS states for forecasting
         self.n_hessian_probes = n_hessian_probes
         self._iter_count = 0            # Iteration counter for seeding Hessian probes
+        self._init_cache = {}           # Per-dataset cache of _init_triple_states results
 
         # Shared Gauss-Newton Hessian estimator
         self._gn_hessian = GaussNewtonHessian(loss_fn, n_hessian_probes, self.dtype)
@@ -217,6 +239,224 @@ class HyperTreeETS:
             mask = torch.ones((data_shape, 1), dtype=self.dtype).reshape(self.n_series, -1)
 
         return mask
+
+    def _seasonal_positions(self, values) -> torch.Tensor:
+        """Convert 1-based seasonal feature values to 0-based tensor indices.
+
+        Validates values lie in ``[1, season_length]``; a 0-based feature
+        (e.g. pandas ``dayofweek``) would silently wrap into the wrong slot.
+
+        Parameters
+        ----------
+        values : array-like
+            Raw values of the ``seasonality_feature`` column.
+
+        Returns
+        -------
+        torch.Tensor
+            0-based seasonal positions as a flat ``torch.long`` tensor.
+        """
+        idx = torch.tensor(np.asarray(values), dtype=torch.long) - 1
+        if idx.numel() > 0:
+            lo = int(idx.min())
+            hi = int(idx.max())
+            if lo < 0 or hi >= self.season_length:
+                raise ValueError(
+                    f"seasonality_feature '{self.seasonality_feature}' must contain "
+                    f"1-based season positions in [1, {self.season_length}]; got values "
+                    f"in [{lo + 1}, {hi + 1}]. Shift 0-based features (e.g. pandas "
+                    f"dayofweek) by +1."
+                )
+        return idx
+
+    def _init_triple_states(
+            self,
+            target: torch.Tensor,
+            mask: torch.Tensor,
+            seasonality_idxs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Initial seasonal indices and level/trend states for triple ETS.
+
+        ``seasonal_init="legacy"`` reproduces the pre-0.2.0 initialization
+        verbatim (flat seasonal profile), required to reproduce earlier
+        results including the paper benchmarks. ``"classical"`` (default)
+        follows R's ``forecast::ets`` / statsforecast: centered 2 x m
+        moving-average detrending, per-slot ratio averages normalized to mean
+        one, and an OLS level/trend seed on the seasonally-adjusted head.
+        Indices are assigned via ``seasonality_idxs`` so they land in the
+        slots the recursion reads; short series and empty slots fall back to
+        a simple per-slot average. All statistics are mask-aware.
+
+        Parameters
+        ----------
+        target : torch.Tensor
+            Observations, shape ``(n_series, T)``.
+        mask : torch.Tensor
+            Validity mask (1 = real observation, 0 = padding),
+            shape ``(n_series, T)``.
+        seasonality_idxs : torch.Tensor
+            0-based seasonal slot per observation, shape ``(n_series, T)``.
+
+        Returns
+        -------
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+            Seasonal indices ``(n_series, season_length)``, initial level
+            ``(n_series,)``, and initial trend ``(n_series,)``.
+        """
+        N, T = target.shape
+        m = self.season_length
+
+        if self.seasonal_init == "legacy":
+            # Pre-0.2.0 initialization, kept verbatim (including its positional
+            # slot assignment and flat resulting profile) so that results from
+            # earlier releases and the paper remain reproducible.
+            init_len = min(m, T)
+            seasonal_avg = torch.zeros((N, init_len), dtype=self.dtype)
+            for i in range(init_len):
+                valid_obs = mask[:, i::init_len]
+                seasonal_avg[:, i] = (target[:, i::init_len] * valid_obs.float()).sum(
+                    1) / valid_obs.float().sum(1).clamp(min=1)
+
+            seasonality = target[:, :init_len] / (seasonal_avg + self.eps)
+            if init_len < m:
+                # Pad with ones for missing season positions
+                pad = torch.ones((N, m - init_len), dtype=self.dtype)
+                seasonality = torch.cat([seasonality, pad], dim=1)
+
+            season_adj = target[:, :init_len] / seasonality[:, :init_len]
+            level0 = season_adj[:, 0]
+            trend0 = season_adj[:, min(1, init_len - 1)] - season_adj[:, 0]
+            return seasonality, level0, trend0
+
+        slot_ids = torch.arange(N, dtype=torch.long).unsqueeze(1) * m + seasonality_idxs  # (N, T)
+        ym = target * mask
+
+        def slot_sum(ids: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+            """Sum ``values`` into their (series, slot) cells -> (N, m)."""
+            return torch.zeros(N * m, dtype=self.dtype).index_add_(
+                0, ids.reshape(-1), values.reshape(-1)
+            ).reshape(N, m)
+
+        # --- Fallback estimator: per-slot average of y over the series mean --
+        cnts = slot_sum(slot_ids, mask)
+        slot_mean = slot_sum(slot_ids, ym) / cnts.clamp(min=1.0)
+        grand_mean = ym.sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+        simple_idx = torch.where(
+            cnts > 0,
+            slot_mean / (grand_mean.unsqueeze(1) + self.eps),
+            torch.ones_like(slot_mean),
+        )
+        seasonality = simple_idx
+
+        # --- Detrended estimator: centered 2 x m MA, then per-slot ratios ----
+        L = m + 1 if m % 2 == 0 else m  # always odd
+        if T >= L:
+            kernel = torch.full((1, 1, L), 1.0 / m, dtype=self.dtype)
+            if m % 2 == 0:
+                kernel[0, 0, 0] = 0.5 / m
+                kernel[0, 0, -1] = 0.5 / m
+            trend_ma = torch.nn.functional.conv1d(
+                ym.unsqueeze(1), kernel
+            ).squeeze(1)  # (N, T - L + 1), centered at offset L // 2
+            window_valid = torch.nn.functional.conv1d(
+                mask.unsqueeze(1), torch.ones((1, 1, L), dtype=self.dtype)
+            ).squeeze(1) >= L - 0.5  # full window unmasked (implies a valid center)
+
+            half = L // 2
+            y_c = target[:, half:T - half]  # window centers, length T - L + 1
+            valid = window_valid & (trend_ma > self.eps)
+            ratios = torch.where(
+                valid, y_c / trend_ma.clamp(min=self.eps), torch.zeros_like(y_c)
+            )
+
+            r_cnts = slot_sum(slot_ids[:, half:T - half], valid.to(self.dtype))
+            detr_idx = slot_sum(slot_ids[:, half:T - half], ratios) / r_cnts.clamp(min=1.0)
+            seasonality = torch.where(r_cnts > 0, detr_idx, simple_idx)
+
+        # Normalize to mean one and guard against tiny indices
+        # (statsforecast clips initial seasonal states at 1e-2 as well).
+        seasonality = seasonality / seasonality.mean(dim=1, keepdim=True).clamp(min=self.eps)
+        seasonality = seasonality.clamp(min=1e-2)
+
+        # --- Level/trend: OLS on the seasonally-adjusted head (as in ets) ----
+        s_t = seasonality.gather(1, seasonality_idxs)
+        y_sa = target / s_t.clamp(min=self.eps)
+        maxn = min(max(10, 2 * m), T)
+        t_idx = torch.arange(1, maxn + 1, dtype=self.dtype).unsqueeze(0)
+        w = mask[:, :maxn]
+        sw = w.sum(dim=1).clamp(min=1.0)
+        mean_t = (w * t_idx).sum(dim=1) / sw
+        mean_y = (w * y_sa[:, :maxn]).sum(dim=1) / sw
+        dev_t = t_idx - mean_t.unsqueeze(1)
+        var_t = (w * dev_t ** 2).sum(dim=1)
+        cov_ty = (w * dev_t * (y_sa[:, :maxn] - mean_y.unsqueeze(1))).sum(dim=1)
+        trend0 = torch.where(
+            var_t > self.eps,
+            cov_ty / var_t.clamp(min=self.eps),
+            torch.zeros_like(cov_ty),
+        )
+        # Evaluate the line at the first observation (t = 1 on the OLS axis)
+        # so level0 matches this recursion's timing, which seeds the state at
+        # the first observation rather than one step before it.
+        level0 = mean_y + trend0 * (1.0 - mean_t)
+
+        return seasonality, level0, trend0
+
+    def _cached_init_triple_states(
+            self,
+            data: lgb.Dataset,
+            target: torch.Tensor,
+            mask: torch.Tensor,
+            seasonality_idxs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Cache wrapper around :meth:`_init_triple_states`.
+
+        The initialization depends only on the data, which is constant across
+        boosting iterations, so results are cached per lgb.Dataset. Entries
+        pin the dataset object, so a key hit proves it is that exact,
+        still-alive dataset. The seasonal indices are cloned on every return
+        because the recursion updates them in place; the cache is cleared by
+        ``train()``.
+
+        Parameters
+        ----------
+        data : lgb.Dataset
+            Dataset whose identity serves as the cache key.
+        target : torch.Tensor
+            Observations, shape ``(n_series, T)``.
+        mask : torch.Tensor
+            Validity mask (1 = real observation, 0 = padding), shape ``(n_series, T)``.
+        seasonality_idxs : torch.Tensor
+            0-based seasonal slot per observation, shape ``(n_series, T)``.
+
+        Returns
+        -------
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+            Seasonal indices ``(n_series, season_length)``, initial level
+            ``(n_series,)``, and initial trend ``(n_series,)``.
+        """
+        key = id(data)
+        entry = self._init_cache.get(key)
+        if entry is not None:
+            return entry["seasonality"].clone(), entry["level0"], entry["trend0"]
+
+        seasonality, level0, trend0 = self._init_triple_states(
+            target, mask, seasonality_idxs
+        )
+        if len(self._init_cache) > 8:
+            # Bound growth from one-shot datasets (e.g. _store_final_states,
+            # conformal re-anchoring); the persistent train/eval entries are
+            # simply recomputed once after a clear.
+            self._init_cache.clear()
+        # Storing the dataset pins its id: a key hit therefore implies this
+        # exact dataset, and with it identical target/mask/positions.
+        self._init_cache[key] = {
+            "data": data,
+            "seasonality": seasonality,
+            "level0": level0,
+            "trend0": trend0,
+        }
+        return seasonality.clone(), level0, trend0
 
     def objective_fn(self, predt: np.ndarray, data: lgb.Dataset) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -367,6 +607,17 @@ class HyperTreeETS:
         - Seasonality: s_t = γ(y_t/(l_{t-1} + φb_{t-1})) + (1-γ)s_{t-m}
         - Fitted: ŷ_t = (l_{t-1} + φb_{t-1}) * s_{t-m}
 
+        Parameters
+        ----------
+        params : torch.Tensor
+            Sigmoid-transformed ETS parameters, shape ``(n_series, T, n_params)``.
+        data : lgb.Dataset
+            LightGBM dataset whose raw DataFrame provides the seasonality feature.
+        target : torch.Tensor
+            Observations, shape ``(n_series, T)``.
+        mask : torch.Tensor
+            Validity mask (1 = real observation, 0 = padding), shape ``(n_series, T)``.
+
         Returns
         -------
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]
@@ -382,59 +633,57 @@ class HyperTreeETS:
         gamma_t = gamma.unbind(dim=1)
         phi_t = phi.unbind(dim=1)
 
-        # Initialize seasonality
-        init_len = min(self.season_length, series_len)
-        seasonal_avg = torch.zeros((self.n_series, init_len), dtype=self.dtype)
-
-        # Compute initial seasonal averages
-        for i in range(init_len):
-            valid_obs = mask[:, i::init_len]
-            seasonal_avg[:, i] = (target[:, i::init_len] * valid_obs.float()).sum(
-                1) / valid_obs.float().sum(1).clamp(min=1)
-
-        # Initialize seasonality as ratios since we are using multiplicative seasonality
-        seasonality = target[:, :init_len] / (seasonal_avg + self.eps)
-        if init_len < self.season_length:
-            # Pad with ones for missing season positions
-            pad = torch.ones((self.n_series, self.season_length - init_len), dtype=self.dtype)
-            seasonality = torch.cat([seasonality, pad], dim=1)
-
-        # ETS initialization using season-adjusted initialization
-        season_adj = target[:, :init_len] / seasonality[:, :init_len]
-        level_prev = season_adj[:, 0]
-        trend_prev = season_adj[:, min(1, init_len - 1)] - season_adj[:, 0]
-        fits = [target[:, 0]]
-
-        # Get seasonal indices from features
-        seasonality_idxs = torch.tensor(
-            data.data[self.seasonality_feature].values - 1,
-            dtype=torch.long
+        # Get seasonal indices from features first: the state initialization
+        # assigns initial indices to the same slots the recursion reads, so a
+        # series that does not start at season position 1 is not rotated.
+        seasonality_idxs = self._seasonal_positions(
+            data.data[self.seasonality_feature].values
         ).reshape(self.n_series, -1)
         batch_idx = torch.arange(self.n_series, dtype=torch.long)
 
-        # Triple ETS updates with masking for padded values
-        for t in range(1, series_len):
-            s_idx = seasonality_idxs[:, t]
-            valid_mask = mask[:, t]
+        # Initialize seasonal indices and level/trend states via the classical
+        # decomposition-based estimator. The result depends only on the data
+        # (never on the boosted parameters), so it is cached per lgb.Dataset
+        # and reused across boosting iterations.
+        seasonality, level_prev, trend_prev = self._cached_init_triple_states(
+            data, target, mask, seasonality_idxs
+        )
+        fits = [target[:, 0]]
 
-            fit_t = valid_mask * (
-                    (level_prev + phi_t[t] * trend_prev) * seasonality[batch_idx, s_idx]
-            ) + (1 - valid_mask) * fits[-1]
+        # Pre-unbind the data tensors so the loop indexes Python tuples
+        # instead of slicing tensors at every step.
+        target_t = target.unbind(dim=1)
+        mask_t = mask.unbind(dim=1)
+        idxs_t = seasonality_idxs.unbind(dim=1)
+
+        # Triple ETS updates with masking for padded values. Shared
+        # subexpressions are hoisted: every node created here is re-traversed
+        # by each backward pass (gradient plus the Hutchinson probes), so a
+        # smaller graph speeds up the forward and every backward.
+        for t in range(1, series_len):
+            valid_mask = mask_t[t]
+            invalid_mask = 1 - valid_mask
+            y_t = target_t[t]
+            s_prev = seasonality[batch_idx, idxs_t[t]]  # s_{t-m}
+            phi_trend = phi_t[t] * trend_prev           # phi_t * b_{t-1}
+            pred_base = level_prev + phi_trend          # l_{t-1} + phi_t * b_{t-1}
+
+            fit_t = valid_mask * (pred_base * s_prev) + invalid_mask * fits[-1]
 
             level_new = valid_mask * (
-                    alpha_t[t] * (target[:, t] / seasonality[batch_idx, s_idx]) +
-                    (1 - alpha_t[t]) * (level_prev + phi_t[t] * trend_prev)
-            ) + (1 - valid_mask) * level_prev
+                    alpha_t[t] * (y_t / s_prev) +
+                    (1 - alpha_t[t]) * pred_base
+            ) + invalid_mask * level_prev
 
             trend_new = valid_mask * (
                     beta_t[t] * (level_new - level_prev) +
-                    (1 - beta_t[t]) * phi_t[t] * trend_prev
-            ) + (1 - valid_mask) * trend_prev
+                    (1 - beta_t[t]) * phi_trend
+            ) + invalid_mask * trend_prev
 
-            seasonality[batch_idx, s_idx] = valid_mask * (
-                    gamma_t[t] * (target[:, t] / (level_prev + phi_t[t] * trend_prev)) +
-                    (1 - gamma_t[t]) * seasonality[batch_idx, s_idx]
-            ) + (1 - valid_mask) * seasonality[batch_idx, s_idx]
+            seasonality[batch_idx, idxs_t[t]] = valid_mask * (
+                    gamma_t[t] * (y_t / pred_base) +
+                    (1 - gamma_t[t]) * s_prev
+            ) + invalid_mask * s_prev
 
             fits.append(fit_t)
             level_prev = level_new
@@ -457,6 +706,17 @@ class HyperTreeETS:
         - Trend: b_t = β(l_t - l_{t-1}) + (1-β)b_{t-1}
         - Fitted: ŷ_t = l_{t-1} + b_{t-1}
 
+        Parameters
+        ----------
+        params : torch.Tensor
+            Sigmoid-transformed ETS parameters, shape ``(n_series, T, n_params)``.
+        data : lgb.Dataset
+            Unused; kept for a uniform forward signature with ``_forward_triple``.
+        target : torch.Tensor
+            Observations, shape ``(n_series, T)``.
+        mask : torch.Tensor
+            Validity mask (1 = real observation, 0 = padding), shape ``(n_series, T)``.
+
         Returns
         -------
         Tuple[torch.Tensor, torch.Tensor, None, List[torch.Tensor]]
@@ -476,21 +736,29 @@ class HyperTreeETS:
         trend_prev = (target[:, last_idx] - target[:, 0]) / max(last_idx, 1)
         fits = [target[:, 0]]
 
-        # Trend-only updates with masking for padded values
-        for t in range(1, series_len):
-            valid_mask = mask[:, t]
+        # Pre-unbind the data tensors so the loop indexes Python tuples
+        # instead of slicing tensors at every step.
+        target_t = target.unbind(dim=1)
+        mask_t = mask.unbind(dim=1)
 
-            fit_t = valid_mask * (level_prev + trend_prev) + (1 - valid_mask) * fits[-1]
+        # Trend-only updates with masking for padded values (shared
+        # subexpressions hoisted; see _forward_triple).
+        for t in range(1, series_len):
+            valid_mask = mask_t[t]
+            invalid_mask = 1 - valid_mask
+            pred_base = level_prev + trend_prev  # l_{t-1} + b_{t-1}
+
+            fit_t = valid_mask * pred_base + invalid_mask * fits[-1]
 
             level_new = valid_mask * (
-                    alpha_t[t] * target[:, t] +
-                    (1 - alpha_t[t]) * (level_prev + trend_prev)
-            ) + (1 - valid_mask) * level_prev
+                    alpha_t[t] * target_t[t] +
+                    (1 - alpha_t[t]) * pred_base
+            ) + invalid_mask * level_prev
 
             trend_new = valid_mask * (
                     beta_t[t] * (level_new - level_prev) +
                     (1 - beta_t[t]) * trend_prev
-            ) + (1 - valid_mask) * trend_prev
+            ) + invalid_mask * trend_prev
 
             fits.append(fit_t)
             level_prev = level_new
@@ -671,10 +939,11 @@ class HyperTreeETS:
         if len(unique_lengths.unique()) > 1:
             raise ValueError("All series in train_data must have the same length. Found multiple lengths.")
 
-        # General model parameters
+        # General model parameters. The objective wrapper stops lgb.train's
+        # params deepcopy from cloning this instance (see NoDeepcopyObjective).
         self.lgb_params = {
             "num_class": self.n_params,
-            "objective": self.objective_fn,
+            "objective": NoDeepcopyObjective(self.objective_fn),
             "metric": "None",
             "random_seed": seed,
             "verbose": verbose
@@ -682,6 +951,7 @@ class HyperTreeETS:
 
         # Reset states
         self._iter_count = 0
+        self._init_cache = {}
         self._fit = None
         self._mask = None
         self._target = None
@@ -770,6 +1040,7 @@ class HyperTreeETS:
                         fcst_h=self.fcst_h,
                         loss_fn=self.loss_fn,
                         n_hessian_probes=self.n_hessian_probes,
+                        seasonal_init=self.seasonal_init,
                     )
 
                 cal_train_kwargs = dict(
@@ -1012,8 +1283,8 @@ class HyperTreeETS:
                         [self.fcst_states[series_id]['seasonality'] for series_id in test_series_ids]
                     )
 
-                    seasonality_idxs = torch.tensor(
-                        test_data[self.seasonality_feature].values - 1
+                    seasonality_idxs = self._seasonal_positions(
+                        test_data[self.seasonality_feature].values
                     ).reshape(self.n_series, self.fcst_h)
                     batch_idx = torch.arange(self.n_series, dtype=torch.long)
                     alpha_fcst = fcst_params[:, :, 0]

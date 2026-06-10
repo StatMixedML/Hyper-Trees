@@ -11,7 +11,7 @@ import time
 from ..utils import CustomLogger
 lgb.register_logger(CustomLogger())
 
-from ..utils import TimeSeriesPreprocessor, prepare_datasets, TrainingResult, validate_series_order
+from ..utils import TimeSeriesPreprocessor, prepare_datasets, TrainingResult, validate_series_order, NoDeepcopyObjective
 
 class HyperTreeSTL:
     """
@@ -112,7 +112,10 @@ class HyperTreeSTL:
             Forecast horizon (number of periods to forecast ahead).
         loss_fn : Callable
             Loss function for optimization. Must be a PyTorch loss function.
-            Default is MSE loss, but can be changed for different error metrics.
+            Default is MSE loss. Losses other than nn.MSELoss are not
+            recommended, as they have not been systematically tested yet.
+            nn.L1Loss is rejected (zero second derivative almost everywhere
+            breaks Newton boosting).
         type : str
             Type of model variant to use. Currently, "default" and "paper" are supported:
             - "paper" uses the original method from the paper
@@ -127,6 +130,13 @@ class HyperTreeSTL:
             raise ValueError("Forecast horizon 'fcst_h' must be a positive integer.")
         if not isinstance(loss_fn, nn.Module):
             raise TypeError("loss_fn must be a PyTorch loss function.")
+        if isinstance(loss_fn, nn.L1Loss):
+            raise ValueError(
+                "nn.L1Loss is not supported: its second derivative is zero almost "
+                "everywhere, so LightGBM's Newton boosting receives all-zero Hessians "
+                "and cannot grow trees. Use nn.HuberLoss or nn.SmoothL1Loss for an "
+                "MAE-like loss with usable curvature."
+            )
         if not isinstance(freq, str):
             raise TypeError("freq must be a string representing the frequency of the time series.")
         if type not in ["default", "paper"]:
@@ -408,6 +418,9 @@ class HyperTreeSTL:
         Forward pass to calculate the trend and seasonality from STL parameters.
         This implementation includes an updated trend smoothing method and more efficient seasonality calculation.
 
+        The trend smoothing window (params[:, :, 2]) is learnable: it enters
+        through a differentiable soft-boxcar kernel so gradients reach the GBDT.
+
         Parameters
         ----------
         params : torch.Tensor
@@ -429,21 +442,37 @@ class HyperTreeSTL:
         slope = params[:, :, 1]
         trend_raw = intercept + slope * time_idx
 
-        # Map logit -> odd window size W in [3, max_w]
-        max_w = min(2 * m + 1, 101)
+        # Map logit -> effective window width in [3, max_w_model] per series.
+        # The width enters through a *soft* boxcar kernel so gradients flow back
+        # to the window parameter; a hard int(median(...).item()) cut would
+        # sever the autograd graph, giving zero gradient AND zero Hessian, and
+        # LightGBM would grow zero-valued trees for it (the window would stay
+        # frozen at its sigmoid(0) midpoint forever).
+        max_w_model = min(2 * m + 1, 101)
         w_logit = params[:, :, 2]
-        w_float = (max_w - 3) * torch.sigmoid(w_logit) + 3.0
-        W = int(torch.median(torch.round(w_float)).clamp(3, max_w).item())
-        if W % 2 == 0:
-            W += 1
+        w_eff = (max_w_model - 3.0) * torch.sigmoid(w_logit.mean(dim=0)) + 3.0  # (N,)
 
-        # Grouped conv expects channels divisible by groups.
-        # Put series in the *channel* dimension: input (1, N, T), weight (N, 1, W), groups=N.
-        k = torch.ones((N, 1, W), dtype=dtype) / W  # (N,1,W)
-        xin = trend_raw.T.contiguous().unsqueeze(0)  # (1,N,T)
-        pad = W // 2
-        xpad = torch.nn.functional.pad(xin, (pad, pad), mode="reflect")  # (1,N,T+2p)
-        trend = torch.nn.functional.conv1d(xpad, k, groups=N).squeeze(0).T  # (T,N)
+        # Kernel support: reflect padding requires pad <= T - 1, so cap the
+        # support at 2T - 1 (short forecast horizons used to crash here when
+        # W // 2 exceeded T - 1). Both arguments are odd, so K stays odd.
+        K = min(max_w_model, 2 * T - 1)
+
+        if K >= 3:
+            w_eff = torch.clamp(w_eff, max=float(K))
+            half = K // 2
+            offsets = torch.arange(-half, half + 1, dtype=dtype).abs().view(1, -1)  # (1,K)
+            # Soft boxcar: weight ~ 1 inside +-w_eff/2, smoothly decaying outside.
+            k = torch.sigmoid(w_eff.view(-1, 1) / 2.0 - offsets)  # (N,K)
+            k = (k / k.sum(dim=1, keepdim=True)).unsqueeze(1)  # (N,1,K)
+
+            # Grouped conv expects channels divisible by groups.
+            # Put series in the *channel* dimension: input (1, N, T), weight (N, 1, K), groups=N.
+            xin = trend_raw.T.contiguous().unsqueeze(0)  # (1,N,T)
+            xpad = torch.nn.functional.pad(xin, (half, half), mode="reflect")  # (1,N,T+2*half)
+            trend = torch.nn.functional.conv1d(xpad, k, groups=N).squeeze(0).T  # (T,N)
+        else:
+            # Series too short to smooth (T == 1); keep the raw linear trend.
+            trend = trend_raw
 
         # Seasonality: Fourier with per-cycle zero-mean centering
         H = (self.n_params - 3) // 2
@@ -463,7 +492,12 @@ class HyperTreeSTL:
         C = (T + m - 1) // m
         pad_T = C * m - T
         if pad_T > 0:
-            tail = torch.flip(seasonality[-min(T, pad_T):, :], dims=[0])
+            # Extend by reflection. When the series is shorter than the padding
+            # (T < pad_T, i.e. less than half a seasonal cycle observed), keep
+            # ping-ponging the reflection until a full cycle can be assembled.
+            tail = torch.flip(seasonality, dims=[0])
+            while tail.shape[0] < pad_T:
+                tail = torch.cat([tail, torch.flip(tail, dims=[0])], dim=0)
             S_ext = torch.cat([seasonality, tail[:pad_T]], dim=0)  # (C*m,N)
         else:
             S_ext = seasonality
@@ -576,10 +610,11 @@ class HyperTreeSTL:
             raise NotImplementedError(f"You have provided {self.n_series} series. Currently, HyperTreeSTL only supports univariate training (1 series at a time). Please train separate models for each series.")
         self.train_series_id = train_data['series_id'].unique()[0]
 
-        # General model parameters
+        # General model parameters. The objective wrapper stops lgb.train's
+        # params deepcopy from cloning this instance (see NoDeepcopyObjective).
         self.lgb_params = {
             "num_class": self.n_params,
-            "objective": self.objective_fn,
+            "objective": NoDeepcopyObjective(self.objective_fn),
             "metric": "None",
             "random_seed": seed,
             "verbose": verbose

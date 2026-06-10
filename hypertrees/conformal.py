@@ -177,7 +177,9 @@ def rolling_origin_residuals(
     Returns
     -------
     scores : np.ndarray
-        Absolute residuals with shape ``(n_windows, n_series, fcst_h)``.
+        Absolute residuals with shape ``(n_windows, n_series, fcst_h)``. If the
+        data carries a ``mask`` column, residuals at padded rows (``mask == 0``)
+        are NaN and are excluded from the interval quantiles downstream.
     series_order : list
         Series ids in first-appearance order (axis 1 of ``scores``).
     """
@@ -226,6 +228,12 @@ def rolling_origin_residuals(
         fcst = model.forecast(test_data=test_df, type="forecast")
 
         resid = np.abs(fcst["fcst"].to_numpy() - test_df["value"].to_numpy())
+        if "mask" in test_df.columns:
+            # Padded pseudo-observations (mask == 0, used by HyperTreeETS for
+            # uniform series lengths) carry no information about real forecast
+            # errors; mark them NaN so the NaN-aware interval quantiles ignore
+            # them.
+            resid = np.where(test_df["mask"].to_numpy().astype(bool), resid, np.nan)
         scores[w] = resid.reshape(len(series_order), fcst_h)
 
     return scores, series_order
@@ -251,14 +259,18 @@ def _align_scores(
 def _distribution_bands(
     point: np.ndarray, scores: np.ndarray, levels: List[int]
 ) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
-    """``conformal_distribution`` intervals (synthetic-path symmetric quantiles)."""
+    """``conformal_distribution`` intervals (synthetic-path symmetric quantiles).
+
+    NaN scores (residuals at padded pseudo-observations) are excluded via
+    NaN-aware quantiles; a cell whose scores are all NaN yields NaN bounds.
+    """
     # Synthetic forecast paths: (2 * n_windows, n_series, h)
     paths = np.concatenate([point[None] - scores, point[None] + scores], axis=0)
     bands = {}
     for lv in levels:
         alpha = 100 - lv
-        lo = np.quantile(paths, (alpha / 2) / 100.0, axis=0)
-        hi = np.quantile(paths, 1.0 - (alpha / 2) / 100.0, axis=0)
+        lo = np.nanquantile(paths, (alpha / 2) / 100.0, axis=0)
+        hi = np.nanquantile(paths, 1.0 - (alpha / 2) / 100.0, axis=0)
         bands[lv] = (lo, hi)
     return bands
 
@@ -266,10 +278,14 @@ def _distribution_bands(
 def _error_bands(
     point: np.ndarray, scores: np.ndarray, levels: List[int]
 ) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
-    """``conformal_error`` intervals (symmetric ``y_hat +/- quantile``)."""
+    """``conformal_error`` intervals (symmetric ``y_hat +/- quantile``).
+
+    NaN scores (residuals at padded pseudo-observations) are excluded via
+    NaN-aware quantiles; a cell whose scores are all NaN yields NaN bounds.
+    """
     bands = {}
     for lv in levels:
-        q = np.quantile(scores, lv / 100.0, axis=0)
+        q = np.nanquantile(scores, lv / 100.0, axis=0)
         bands[lv] = (point - q, point + q)
     return bands
 

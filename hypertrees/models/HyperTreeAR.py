@@ -11,7 +11,7 @@ import time
 from ..utils import CustomLogger
 lgb.register_logger(CustomLogger())
 
-from ..utils import TimeSeriesPreprocessor, prepare_datasets, TrainingResult, validate_series_order, extract_forecast_lags, GaussNewtonHessian
+from ..utils import TimeSeriesPreprocessor, prepare_datasets, TrainingResult, validate_series_order, extract_forecast_lags, GaussNewtonHessian, NoDeepcopyObjective
 from ..conformal import (
     ForecastIntervals,
     validate_calibration_length,
@@ -93,7 +93,7 @@ class HyperTreeAR:
             freq: str = "M",
             fcst_h: int = 1,
             loss_fn: Callable = nn.MSELoss(),
-            hessian_method: str = "exact",
+            hessian_method: str = "analytic",
             n_hessian_probes: int = 5,
     ):
         """
@@ -110,10 +110,24 @@ class HyperTreeAR:
             Forecast horizon (number of periods to forecast ahead).
         loss_fn : Callable
             Loss function for optimization. Must be a PyTorch loss function.
-            Default is MSE loss, but can be changed for different error metrics.
+            Default is MSE loss. Losses other than nn.MSELoss are not
+            recommended, as they have not been systematically tested yet.
+            nn.L1Loss is rejected (zero second derivative almost everywhere
+            breaks Newton boosting).
         hessian_method : str
             Method for computing the Hessian diagonal. Options:
-            - "exact": Exact diagonal Hessian via per-parameter second-order autograd.
+            - "exact": Exact diagonal Hessian via per-parameter second-order autograd
+              (one backward pass per lag and iteration).
+            - "analytic": Closed-form gradients and exact diagonal Hessians,
+              exploiting that the AR fit is linear in its parameters
+              (dL/dtheta_j = l'(y_hat) * lag_j and d2L/dtheta_j2 = l''(y_hat) * lag_j**2,
+              the second-order fit term vanishing exactly). Produces the same
+              values as "exact" for any loss that is a mean/sum of
+              per-observation terms -- which covers all standard PyTorch
+              regression losses -- at a fraction of the cost: at most one
+              small double-backward through loss(fit, target) instead of one
+              backward per lag. nn.MSELoss uses a fully closed-form fast path
+              with no autograd at all.
             - "gn": Gauss-Newton approximation estimated via Hutchinson probing.
               Guarantees positive semi-definite Hessians. Avoids second-order
               differentiation at the cost of Hutchinson estimation variance.
@@ -131,8 +145,15 @@ class HyperTreeAR:
             raise TypeError("freq must be a string.")
         if not isinstance(loss_fn, nn.Module):
             raise TypeError("loss_fn must be a PyTorch loss function.")
-        if hessian_method not in ("exact", "gn"):
-            raise ValueError("hessian_method must be either 'exact' or 'gn'.")
+        if isinstance(loss_fn, nn.L1Loss):
+            raise ValueError(
+                "nn.L1Loss is not supported: its second derivative is zero almost "
+                "everywhere, so LightGBM's Newton boosting receives all-zero Hessians "
+                "and cannot grow trees. Use nn.HuberLoss or nn.SmoothL1Loss for an "
+                "MAE-like loss with usable curvature."
+            )
+        if hessian_method not in ("exact", "analytic", "gn"):
+            raise ValueError("hessian_method must be one of 'exact', 'analytic', or 'gn'.")
         if not isinstance(n_hessian_probes, int) or n_hessian_probes <= 0:
             raise ValueError("n_hessian_probes must be a positive integer.")
 
@@ -160,6 +181,7 @@ class HyperTreeAR:
         self._iter_count = 0
         self._fit = None
         self._target = None
+        self._lags = None
 
         # Conformal prediction interval state (populated when train() is called
         # with forecast_intervals).
@@ -171,6 +193,8 @@ class HyperTreeAR:
         # Bind Hessian computation strategy
         if hessian_method == "exact":
             self.calculate_gradients_and_hessians = self._calculate_gradients_and_hessians_exact
+        elif hessian_method == "analytic":
+            self.calculate_gradients_and_hessians = self._calculate_gradients_and_hessians_analytic
         else:
             self._gn_hessian = GaussNewtonHessian(loss_fn, n_hessian_probes, self.dtype)
             self.calculate_gradients_and_hessians = self._calculate_gradients_and_hessians_gn
@@ -289,14 +313,29 @@ class HyperTreeAR:
         # Calculate loss between forecasts and actual values
         loss = self.loss_fn(fcst, target)
 
-        if self.hessian_method == "gn":
+        if self.hessian_method in ("gn", "analytic"):
             self._fit = fcst
             self._target = target
+            self._lags = lags
 
         return params, loss
 
     def _calculate_gradients_and_hessians_exact(self, loss: torch.Tensor, params: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
-        """Exact diagonal Hessian via per-parameter second-order autograd."""
+        """Exact diagonal Hessian via per-parameter second-order autograd.
+
+        Parameters
+        ----------
+        loss : torch.Tensor
+            Loss value from the model.
+        params : torch.Tensor
+            Model parameters (AR coefficients as an ``nn.Parameter``,
+            shape ``(n_samples, p)``).
+
+        Returns
+        -------
+        Tuple[np.ndarray, np.ndarray]
+            Gradients and hessians as numpy arrays in the format expected by LightGBM.
+        """
         loss.backward(create_graph=True)
         grad = params.grad
         hess = [
@@ -310,13 +349,82 @@ class HyperTreeAR:
 
         return grad, hess
 
+    def _calculate_gradients_and_hessians_analytic(self, loss: torch.Tensor, params: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
+        """Closed-form gradients and exact diagonal Hessians via model linearity.
+
+        Since the AR fit is linear in its parameters, ``grad = l'(y_hat) * lags``
+        and ``hess = l''(y_hat) * lags**2``, matching the "exact" method for any
+        per-observation loss. MSELoss uses closed-form derivatives; other losses
+        use one small double-backward through ``loss(fit, target)``.
+
+        Parameters
+        ----------
+        loss : torch.Tensor
+            Loss value from the model (unused; derivatives come from the
+            fit/target/lags stored by ``get_params_loss``).
+        params : torch.Tensor
+            Model parameters (unused, kept for a uniform dispatch signature).
+
+        Returns
+        -------
+        Tuple[np.ndarray, np.ndarray]
+            Gradients and hessians as numpy arrays in the format expected by LightGBM.
+        """
+        fit = self._fit.detach()
+        target = self._target
+        lags = self._lags
+
+        if isinstance(self.loss_fn, nn.MSELoss) and self.loss_fn.reduction in ("mean", "sum"):
+            # MSE fast path: l' = scale * (y_hat - y), l'' = scale
+            scale = 2.0 / fit.numel() if self.loss_fn.reduction == "mean" else 2.0
+            g = scale * (fit - target)
+            h = torch.full_like(fit, scale)
+        else:
+            # Generic path: per-element first and second loss derivatives via
+            # a double-backward through the (tiny) loss(fit, target) graph.
+            # Requires the loss to have a well-defined double-backward (true
+            # for HuberLoss/SmoothL1Loss and other standard smooth losses).
+            # nn.L1Loss is rejected in __init__: its zero curvature breaks
+            # Newton boosting, and torch 2.8.0's l1_loss double-backward can
+            # return an uninitialized buffer instead of zeros.
+            fit_leaf = fit.requires_grad_(True)
+            loss_local = self.loss_fn(fit_leaf, target)
+            g = autograd(loss_local, fit_leaf, create_graph=True)[0]
+            h = autograd(g.sum(), fit_leaf)[0].detach()
+            g = g.detach()
+
+        # Broadcast (N, 1) loss derivatives over the (N, p) lag matrix.
+        grad = (g * lags).cpu().numpy().ravel(order="F")
+        hess = (h * lags ** 2).cpu().numpy().ravel(order="F")
+
+        self._fit = None
+        self._target = None
+        self._lags = None
+
+        return grad, hess
+
     def _calculate_gradients_and_hessians_gn(self, loss: torch.Tensor, params: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
-        """Gauss-Newton Hessian diagonal estimated via Hutchinson probing."""
+        """Gauss-Newton Hessian diagonal estimated via Hutchinson probing.
+
+        Parameters
+        ----------
+        loss : torch.Tensor
+            Loss value from the model.
+        params : torch.Tensor
+            Model parameters (AR coefficients as an ``nn.Parameter``,
+            shape ``(n_samples, p)``).
+
+        Returns
+        -------
+        Tuple[np.ndarray, np.ndarray]
+            Gradients and hessians as numpy arrays in the format expected by LightGBM.
+        """
         grad = autograd(loss, params, retain_graph=True)[0]
         rng = torch.Generator().manual_seed(self._iter_count)
         hess = self._gn_hessian.estimate(self._fit, self._target, params, rng)
         self._fit = None
         self._target = None
+        self._lags = None
         grad = grad.cpu().detach().numpy().ravel(order="F")
         hess = hess.cpu().detach().numpy().ravel(order="F")
 
@@ -430,10 +538,11 @@ class HyperTreeAR:
                 train_data, self.fcst_h, forecast_intervals, min_train=self.p + 1
             )
 
-        # General model parameters
+        # General model parameters. The objective wrapper stops lgb.train's
+        # params deepcopy from cloning this instance (see NoDeepcopyObjective).
         self.lgb_params = {
             "num_class": self.p,
-            "objective": self.objective_fn,
+            "objective": NoDeepcopyObjective(self.objective_fn),
             "metric": "None",
             "random_seed": seed,
             "verbose": verbose
@@ -446,6 +555,7 @@ class HyperTreeAR:
         self._iter_count = 0
         self._fit = None
         self._target = None
+        self._lags = None
         self.model = None
         self.dataset_references = {}
         self.is_trained = False
@@ -725,10 +835,9 @@ class HyperTreeAR:
 
             elif type == "parameters":
                 params_fcst = np.asarray(self.model.predict(test_data[self.features]))
-                # LightGBM may return 1D (column-major) or 2D depending on version/objective.
-                # Normalize to (n_test, p) before indexing.
+                # Booster.predict returns (n_test, p) for multi-class output
                 if params_fcst.ndim == 1:
-                    params_fcst = params_fcst.reshape(-1, self.p, order="F")
+                    params_fcst = params_fcst.reshape(-1, self.p)
                 out_df = pd.DataFrame({
                     "series_id": test_data["series_id"].to_numpy().flatten(),
                     "date": test_data["date"].to_numpy().flatten(),
