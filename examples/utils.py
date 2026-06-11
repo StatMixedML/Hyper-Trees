@@ -204,6 +204,364 @@ def plot_example_forecast(
     plt.show()
 
 
+def simulate_var_panel(
+    k: int = 10,
+    n_train: int = 240,
+    fcst_h: int = 12,
+    seed: int = 42,
+) -> tuple:
+    """Simulate an aligned panel from a stable VAR(1) with a lead/lag chain.
+
+    Each series follows its own past and its neighbor's previous month
+    (``A[i, i-1] = 0.3``), so the panel carries genuine cross-series
+    structure that a vector autoregression can exploit. A common monthly
+    seasonal profile and strongly heterogeneous per-series scales are
+    applied on top. Columns: ``series_id``, ``date``, ``value`` plus the
+    features ``month``, ``quarter``, and ``series_num`` (pandas ``category``
+    dtype, so LightGBM applies true categorical splits).
+
+    Parameters
+    ----------
+    k : int, default 10
+        Number of series.
+    n_train : int, default 240
+        Training observations per series.
+    fcst_h : int, default 12
+        Test observations per series (the forecast horizon).
+    seed : int, default 42
+        Seed for the random number generator.
+
+    Returns
+    -------
+    tuple
+        ``(df, train, test)`` where ``df`` is the full panel and
+        ``train`` / ``test`` are the per-series head/tail splits.
+    """
+    rng = np.random.RandomState(seed)
+    dates = pd.date_range("2000-01-01", periods=n_train + fcst_h, freq="MS")
+
+    # Stable VAR(1) with a lead/lag chain
+    A = 0.5 * np.eye(k)
+    for i in range(1, k):
+        A[i, i - 1] = 0.3
+
+    const = 10.0 * (np.eye(k) - A).sum(axis=1)
+    Y = np.full((len(dates), k), 10.0)
+    for t in range(1, len(dates)):
+        Y[t] = const + A @ Y[t - 1] + 0.5 * rng.randn(k)
+
+    # Common monthly seasonality and heterogeneous series scales
+    season = 1.0 + 0.25 * np.sin(2 * np.pi * np.arange(1, 13) / 12)
+    scales = rng.uniform(20, 2000, size=k)
+    Y *= season[dates.month - 1][:, None] * scales[None, :] / 10.0
+
+    df = pd.concat(
+        [
+            pd.DataFrame({
+                "series_id": f"Series {i + 1}",
+                "date": dates,
+                "value": Y[:, i],
+                "month": dates.month,
+                "quarter": dates.quarter,
+                "series_num": i,
+            })
+            for i in range(k)
+        ],
+        ignore_index=True,
+    )
+    df["series_num"] = df["series_num"].astype("category")
+
+    train = df.groupby("series_id", sort=False).head(n_train).reset_index(drop=True)
+    test = df.groupby("series_id", sort=False).tail(fcst_h).reset_index(drop=True)
+
+    return df, train, test
+
+
+def simulate_intermittent_panel(
+    k: int = 20,
+    n_train: int = 156,
+    fcst_h: int = 12,
+    seed: int = 42,
+) -> tuple:
+    """Simulate an aligned panel of intermittent (zero-inflated) demand series.
+
+    Each SKU's weekly demand is the product of two feature-driven components,
+    which is exactly the structure the TSB method targets:
+
+    * a demand *probability* (occurrence) that rises during promotions and
+      follows a mild monthly seasonal cycle, and
+    * a demand *size* (units when demand occurs) that is larger during
+      promotions.
+
+    Both components depend on a binary ``promo`` feature and on ``month``, so a
+    Hyper-Tree-TSB whose smoothing rates are functions of features has real
+    structure to exploit. Columns: ``series_id``, ``date``, ``value`` plus the
+    features ``month``, ``promo``, and ``series_num`` (pandas ``category``
+    dtype, so LightGBM applies true categorical splits). All series share the
+    same length, as TSB requires.
+
+    Parameters
+    ----------
+    k : int, default 20
+        Number of SKUs (series).
+    n_train : int, default 156
+        Training observations per series (weeks).
+    fcst_h : int, default 12
+        Test observations per series (the forecast horizon).
+    seed : int, default 42
+        Seed for the random number generator.
+
+    Returns
+    -------
+    tuple
+        ``(df, train, test)`` where ``df`` is the full panel and
+        ``train`` / ``test`` are the per-series head/tail splits.
+    """
+    rng = np.random.RandomState(seed)
+    T = n_train + fcst_h
+    dates = pd.date_range("2015-01-05", periods=T, freq="W-MON")
+    month = dates.month.to_numpy()
+
+    # Per-SKU baselines for occurrence probability (logit) and size (log),
+    # plus a shared monthly seasonal effect on the occurrence probability.
+    base_logit = rng.uniform(-2.2, -0.4, size=k)   # mostly low occurrence
+    base_logsize = rng.uniform(0.5, 2.0, size=k)   # heterogeneous sizes
+    season_logit = 0.5 * np.sin(2 * np.pi * month / 12)
+
+    frames = []
+    for i in range(k):
+        # Each SKU has its own promotion calendar: short recurring bursts.
+        promo = np.zeros(T, dtype=int)
+        start = rng.randint(2, 8)
+        while start < T:
+            promo[start:start + rng.randint(1, 3)] = 1
+            start += rng.randint(6, 14)
+
+        # Probability of demand and mean demand size, both functions of features.
+        p = 1.0 / (1.0 + np.exp(-(base_logit[i] + season_logit + 1.3 * promo)))
+        mu = np.exp(base_logsize[i] + 0.6 * promo)
+
+        occurrence = (rng.uniform(size=T) < p).astype(float)
+        size = rng.poisson(mu) + 1.0          # at least one unit when demand occurs
+        value = occurrence * size
+
+        frames.append(pd.DataFrame({
+            "series_id": f"SKU {i + 1}",
+            "date": dates,
+            "value": value.astype(float),
+            "month": month,
+            "promo": promo,
+            "series_num": i,
+        }))
+
+    df = pd.concat(frames, ignore_index=True)
+    df["series_num"] = df["series_num"].astype("category")
+
+    train = df.groupby("series_id", sort=False).head(n_train).reset_index(drop=True)
+    test = df.groupby("series_id", sort=False).tail(fcst_h).reset_index(drop=True)
+
+    return df, train, test
+
+
+def plot_forecasts(
+    datasets: list,
+    split_date=None,
+    title: str = "Forecasting Results",
+    xlabel: str = "Date",
+    ylabel: str = "Value",
+    level: int = None,
+) -> None:
+    """Plot actuals and model forecasts on a single axis.
+
+    Parameters
+    ----------
+    datasets : list of tuple
+        Entries ``(data, x_col, y_col, label, color, style)``, one per line.
+    split_date : optional
+        If given, a dotted vertical line marks the train/test split.
+    title, xlabel, ylabel : str
+        Axis annotations.
+    level : int, optional
+        If given, every forecast DataFrame carrying
+        ``<model>-lo-<level>`` / ``<model>-hi-<level>`` columns gets its
+        conformal interval shaded in the line's color.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as e:
+        raise ImportError(
+            "matplotlib is required for plotting. "
+            "Install it with: pip install hypertrees[plot]"
+        ) from e
+
+    plt.figure(figsize=(12, 5))
+    for data, x_col, y_col, label, color, style in datasets:
+        plt.plot(data[x_col], data[y_col], label=label, color=color,
+                 linestyle=style, linewidth=2, alpha=0.8)
+        if level is not None and "model" in data.columns:
+            model = data["model"].iloc[0]
+            lo, hi = f"{model}-lo-{level}", f"{model}-hi-{level}"
+            if lo in data.columns and hi in data.columns:
+                plt.fill_between(data[x_col], data[lo], data[hi], color=color,
+                                 alpha=0.15, label=f"{level}% Interval ({model})")
+    if split_date is not None:
+        plt.axvline(x=split_date, color="black", linestyle=":", alpha=0.7, label="Train/Test Split")
+
+    plt.title(title, fontsize=16)
+    plt.xlabel(xlabel, fontsize=12)
+    plt.ylabel(ylabel, fontsize=12)
+    plt.legend(fontsize=11)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_panel_forecasts(
+    datasets: list,
+    series_ids: list,
+    split_date=None,
+    interval_fcst: pd.DataFrame = None,
+    level: int = 80,
+    history: int = 100,
+    title: str = "Forecasting Results - Simulated VAR Panel",
+) -> None:
+    """Plot actuals and model forecasts for several panel series side by side.
+
+    One subplot per entry of ``series_ids`` with a single global legend
+    below the panels. Each DataFrame in ``datasets`` must carry a
+    ``series_id`` column.
+
+    Parameters
+    ----------
+    datasets : list of tuple
+        Entries ``(data, x_col, y_col, label, color, style)``, one per line.
+        Actual-value entries (``y_col == "value"``) are truncated to the
+        last ``history`` rows per series.
+    series_ids : list
+        Series to plot, one subplot each.
+    split_date : optional
+        If given, a dotted vertical line marks the train/test split.
+    interval_fcst : pd.DataFrame, optional
+        Forecast output with ``<model>-lo-<level>`` / ``<model>-hi-<level>``
+        columns; the band is shaded in each subplot.
+    level : int, default 80
+        Confidence level of the shaded interval.
+    history : int, default 72
+        Number of trailing actual observations to show per series.
+    title : str
+        Figure title.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as e:
+        raise ImportError(
+            "matplotlib is required for plotting. "
+            "Install it with: pip install hypertrees[plot]"
+        ) from e
+
+    fig, axes = plt.subplots(1, len(series_ids), figsize=(5 * len(series_ids), 5), sharex=True)
+    axes = np.atleast_1d(axes)
+    model = interval_fcst["model"].iloc[0] if interval_fcst is not None else None
+
+    for ax, sid in zip(axes, series_ids):
+        for data, x_col, y_col, label, color, style in datasets:
+            series = data[data["series_id"] == sid]
+            if y_col == "value":
+                series = series.tail(history)
+            ax.plot(series[x_col], series[y_col], label=label, color=color,
+                    linestyle=style, linewidth=2, alpha=0.8)
+        if interval_fcst is not None:
+            band = interval_fcst[interval_fcst["series_id"] == sid]
+            ax.fill_between(band["date"], band[f"{model}-lo-{level}"], band[f"{model}-hi-{level}"],
+                            color="green", alpha=0.15, label=f"{level}% Interval ({model})")
+        if split_date is not None:
+            ax.axvline(x=split_date, color="black", linestyle=":", alpha=0.7, label="Train/Test Split")
+        ax.set_title(sid, fontsize=12)
+        ax.grid(True, alpha=0.3)
+        ax.tick_params(axis="x", rotation=30)
+
+    fig.suptitle(title, fontsize=16)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=3, fontsize=11)
+    plt.tight_layout(rect=(0, 0.12, 1, 0.96))
+    plt.show()
+
+
+def plot_model_intervals(
+    actuals: pd.DataFrame,
+    forecasts: dict,
+    levels: list = None,
+    title: str = None,
+) -> None:
+    """Plot actuals, forecast, and conformal interval bands, one subplot per model.
+
+    Interval columns named ``<model>-lo-<level>`` / ``<model>-hi-<level>``
+    (produced by ``forecast(..., level=[...])``) are detected automatically
+    and shaded, widest level first. A single global legend sits below the
+    panels.
+
+    Parameters
+    ----------
+    actuals : pd.DataFrame
+        Realized values with ``date`` and ``value`` columns.
+    forecasts : dict
+        Mapping of subplot title to a forecast DataFrame containing
+        ``date``, ``fcst``, and a ``model`` column.
+    levels : list of int, optional
+        Restrict which detected levels are shaded; by default all are shown.
+    title : str, optional
+        Figure title.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as e:
+        raise ImportError(
+            "matplotlib is required for plotting. "
+            "Install it with: pip install hypertrees[plot]"
+        ) from e
+
+    fig, axes = plt.subplots(1, len(forecasts), figsize=(6 * len(forecasts), 5), sharey=True)
+    axes = np.atleast_1d(axes)
+
+    for ax, (name, fcst_df) in zip(axes, forecasts.items()):
+        model = fcst_df["model"].iloc[0]
+        ax.plot(actuals["date"], actuals["value"], label="Actual",
+                color="#2E86AB", linewidth=2, alpha=0.8)
+        ax.plot(fcst_df["date"], fcst_df["fcst"], label="Forecast",
+                color="green", linestyle="--", linewidth=2)
+
+        detected = sorted(
+            int(m.group(1))
+            for c in fcst_df.columns
+            for m in [re.fullmatch(rf"{re.escape(model)}-lo-(\d+)", c)]
+            if m
+        )
+        if levels is not None:
+            detected = [lv for lv in detected if lv in set(levels)]
+        # Shade widest band first so narrower bands sit on top.
+        alphas = [0.15, 0.28, 0.40]
+        shade = {lv: a for lv, a in zip(sorted(detected, reverse=True), alphas)}
+        for lv in sorted(detected, reverse=True):
+            ax.fill_between(
+                fcst_df["date"],
+                fcst_df[f"{model}-lo-{lv}"],
+                fcst_df[f"{model}-hi-{lv}"],
+                color="green", alpha=shade.get(lv, 0.2), label=f"{lv}% Interval",
+            )
+
+        ax.axvline(x=fcst_df["date"].min(), color="black", linestyle=":",
+                   alpha=0.7, label="Train/Test Split")
+        ax.set_title(name, fontsize=14)
+        ax.grid(True, alpha=0.3)
+
+    if title is not None:
+        fig.suptitle(title, fontsize=16)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=len(labels), fontsize=11)
+    plt.tight_layout(rect=(0, 0.08, 1, 0.96 if title is not None else 1.0))
+    plt.show()
+
+
 def coverage(
     df: pd.DataFrame,
     level: int,

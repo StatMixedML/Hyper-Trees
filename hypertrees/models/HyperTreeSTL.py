@@ -704,7 +704,7 @@ class HyperTreeSTL:
 
         except Exception as e:
             self.is_trained = False
-            raise RuntimeError(f"Training failed: {str(e)}")
+            raise RuntimeError(f"Training failed: {str(e)}") from e
 
     def forecast(
             self,
@@ -838,4 +838,4 @@ class HyperTreeSTL:
             return out_df
 
         except Exception as e:
-            raise RuntimeError(f"Forecasting not successful: {str(e)}")
+            raise RuntimeError(f"Forecasting not successful: {str(e)}") from e

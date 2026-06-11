@@ -34,11 +34,11 @@ def extract_forecast_lags(history: pd.DataFrame, p: int) -> dict:
         ``{series_id: np.ndarray}`` with each array of length *p* in
         newest-first order, matching the convention used by ``forecast()``.
     """
-    return (
-        history.groupby(["series_id"], sort=False)
-        .apply(lambda x: x["value"][-p:][::-1].values)
-        .to_dict()
-    )
+    tail = history.groupby("series_id", sort=False).tail(p)
+    return {
+        sid: g["value"].to_numpy()[::-1]
+        for sid, g in tail.groupby("series_id", sort=False)
+    }
 
 
 def validate_series_order(data: pd.DataFrame, name: str = "data") -> None:

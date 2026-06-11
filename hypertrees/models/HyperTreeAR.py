@@ -665,7 +665,7 @@ class HyperTreeAR:
 
         except Exception as e:
             self.is_trained = False
-            raise RuntimeError(f"Training failed: {str(e)}")
+            raise RuntimeError(f"Training failed: {str(e)}") from e
 
     def set_forecast_origin(self, history: pd.DataFrame) -> None:
         """Re-anchor the AR lag seed to the end of *history* without retraining.
@@ -850,4 +850,4 @@ class HyperTreeAR:
             return out_df
 
         except Exception as e:
-            raise RuntimeError(f"Forecasting not successful: {str(e)}")
+            raise RuntimeError(f"Forecasting not successful: {str(e)}") from e

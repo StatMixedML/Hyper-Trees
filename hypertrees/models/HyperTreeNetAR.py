@@ -27,7 +27,7 @@ class HyperTreeNetAR:
     Class that implements a Hyper-TreeNet-AR(p) model for time series forecasting.
 
     It combines LightGBM with a neural network, where the LightGBM first creates embeddings from the input data which
-    are then mapped as parameters to the target time series model. The HyperTree-AR(p) model extends traditional
+    are then mapped as parameters to the target time series model. The Hyper-TreeNet-AR(p) model extends traditional
     autoregressive models by allowing the AR coefficients to be time-varying and estimated by a
     combination of neural network and gradient boosted trees. This creates a non-linear, adaptive autoregressive model
     that can capture complex temporal dependencies.
@@ -141,7 +141,9 @@ class HyperTreeNetAR:
             This allows for GPU acceleration of network training if available.
         hessian_method : str
             Method for computing the Hessian diagonal. Options:
-            - "exact": Exact diagonal Hessian via per-parameter second-order autograd.
+            - "exact": Exact diagonal Hessian via per-embedding-dimension
+              second-order autograd (cheap, since the embedding is
+              low-dimensional).
             - "gn": Gauss-Newton approximation estimated via Hutchinson probing.
               Guarantees positive semi-definite Hessians. Avoids second-order
               differentiation at the cost of Hutchinson estimation variance.
@@ -265,7 +267,7 @@ class HyperTreeNetAR:
             warnings.warn("Unknown dataset in metric_fn. Using training lags.")
 
         # Calculate loss
-        is_higher_better = False
+        is_higher_better = False  # Lower loss is better, so we don't maximize
         target = torch.tensor(eval_data.get_label().reshape(-1, 1), dtype=self.dtype, device=self.device)
 
         # For evaluation, we need to compute loss without any backward pass or gradient computation
@@ -438,26 +440,9 @@ class HyperTreeNetAR:
             for i in range(self.embedding_dim)
         ]
 
-        # Batched Hessian-diagonal computation: replaces the per-dim Python loop with a single batched autograd call.
-        # n, k = grad.shape
-        # grad_outputs = (
-        #     torch.eye(k, device=grad.device, dtype=grad.dtype)
-        #     .unsqueeze(1)
-        #     .expand(k, n, k)
-        # )
-        # hess_full = autograd(
-        #     grad,
-        #     embeds,
-        #     grad_outputs=grad_outputs,
-        #     is_grads_batched=True,
-        #     retain_graph=True,
-        # )[0]  # (k, n, k)
-        # hess = torch.diagonal(hess_full, dim1=0, dim2=2)  # (n, k)
-
         # Convert to numpy arrays and reshape as expected by LightGBM
         grad = grad.cpu().detach().numpy().ravel(order="F")
         hess = torch.cat(hess, dim=1).cpu().detach().numpy().ravel(order="F")
-        # hess = hess.cpu().detach().numpy().ravel(order="F") # only for the batched version
 
         return grad, hess
 
@@ -574,7 +559,7 @@ class HyperTreeNetAR:
         This method:
         1. Preprocesses the time series data to create lag features
         2. Sets up LightGBM datasets
-        3. Train the models
+        3. Trains the models
 
         The training data must contain columns:
         - 'series_id': Identifier for each time series
@@ -625,7 +610,7 @@ class HyperTreeNetAR:
 
         Returns
         -------
-         TrainingResult
+        TrainingResult
             Object containing evaluation results and training information.
         """
         # Validate inputs
@@ -844,7 +829,7 @@ class HyperTreeNetAR:
 
         except Exception as e:
             self.is_trained = False
-            raise RuntimeError(f"Training failed: {str(e)}")
+            raise RuntimeError(f"Training failed: {str(e)}") from e
 
     def set_forecast_origin(self, history: pd.DataFrame) -> None:
         """Re-anchor the AR lag seed to the end of *history* without retraining.
@@ -970,8 +955,10 @@ class HyperTreeNetAR:
 
         try:
             # Get tree embeddings
+            # Predict on the DataFrame (not .values) so pandas ``category``
+            # dtype features keep their categorical encoding at forecast time.
             gbdt_embeds = torch.tensor(
-                self.model.predict(test_data[self.features].values),
+                self.model.predict(test_data[self.features]),
                 dtype=self.dtype,
                 device=self.device
             ).reshape(-1, self.embedding_dim)
@@ -1056,4 +1043,4 @@ class HyperTreeNetAR:
             return out_df
 
         except Exception as e:
-            raise RuntimeError(f"Forecasting not successful: {str(e)}")
+            raise RuntimeError(f"Forecasting not successful: {str(e)}") from e

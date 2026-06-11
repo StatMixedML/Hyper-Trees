@@ -47,7 +47,7 @@ class TestHyperTreeETSInitialization:
         assert model.n_params == 2
 
     def test_invalid_ets_type(self):
-        with pytest.raises(ValueError, match="ets_type must be either 'triple' or 'trend'"):
+        with pytest.raises(ValueError, match="ets_type must be one of 'triple', 'additive', or 'trend'"):
             HyperTreeETS(ets_type="invalid", season_length=12, seasonality_feature="month")
 
     def test_invalid_season_length(self):
@@ -1078,3 +1078,230 @@ class TestInitTripleStates:
 
         torch.testing.assert_close(seasonality[0], S, atol=0.05, rtol=0.0)
         assert abs(level0.item() - 50.0) < 2.5
+
+
+# ----------------------------------------------------------------------
+# Additive-seasonality variant (ets_type="additive")
+# ----------------------------------------------------------------------
+K_A, T_A, M_A, FCST_H_A = 2, 72, 12, 6
+LGB_PARAMS_A = {"learning_rate": 0.1, "min_data_in_leaf": 5}
+
+
+def make_additive_panel(k=K_A, n_train=T_A, fcst_h=FCST_H_A, seed=0, offset=0.0):
+    """Aligned panel with linear trend plus additive monthly seasonality.
+
+    With ``offset`` the series can be shifted to cross zero, which the
+    multiplicative variant cannot handle.
+    """
+    rng = np.random.RandomState(seed)
+    dates = pd.date_range("2015-01-01", periods=n_train + fcst_h, freq="MS")
+    t = np.arange(1, len(dates) + 1)
+    season = 10.0 * np.sin(2 * np.pi * dates.month / M_A)
+
+    frames = []
+    for i in range(k):
+        values = offset + 50.0 * (i + 1) + 0.5 * t + season + 0.5 * rng.randn(len(dates))
+        frames.append(pd.DataFrame({
+            "series_id": f"s{i}",
+            "date": dates,
+            "value": values,
+            "month": dates.month,
+            "series_num": i,
+        }))
+    df = pd.concat(frames, ignore_index=True)
+    train = df.groupby("series_id", sort=False).head(n_train).reset_index(drop=True)
+    test = df.groupby("series_id", sort=False).tail(fcst_h).reset_index(drop=True)
+
+    return train, test
+
+
+def make_additive_model(fcst_h=FCST_H_A):
+    return HyperTreeETS(
+        ets_type="additive", seasonality_feature="month",
+        season_length=M_A, freq="M", fcst_h=fcst_h,
+    )
+
+
+class FakeDataset:
+    """Mimics the lgb.Dataset attributes used by the ETS forward pass."""
+
+    def __init__(self, df):
+        self.data = df
+
+
+class TestAdditiveInitialization:
+    def test_constructor(self):
+        model = make_additive_model()
+        assert model.ets_type == "additive"
+        assert model.n_params == 4
+
+    def test_seasonality_feature_required(self):
+        with pytest.raises(ValueError, match="seasonality_feature must be provided"):
+            HyperTreeETS(ets_type="additive", season_length=12)
+
+    def test_recovers_clean_additive_components(self):
+        """On noise-free linear-trend + additive-seasonal data, the classical
+        additive initialization recovers the seasonal profile, trend, and the
+        level (line evaluated at the first observation) exactly: the centered
+        2 x m moving average removes the seasonality and reproduces the linear
+        trend, so the per-slot detrended differences equal the true indices."""
+        model = make_additive_model()
+        n, level0_true, trend_true = 6 * M_A, 100.0, 0.5
+        dates = pd.date_range("2015-01-01", periods=n, freq="MS")
+        season_profile = 10.0 * np.sin(2 * np.pi * np.arange(1, M_A + 1) / M_A)
+        season_profile -= season_profile.mean()  # mean-zero truth
+        t = np.arange(1, n + 1)
+        y = level0_true + trend_true * (t - 1) + season_profile[dates.month - 1]
+
+        target = torch.tensor(y.reshape(1, -1), dtype=torch.float32)
+        mask = torch.ones_like(target)
+        idxs = torch.tensor(dates.month.to_numpy() - 1).reshape(1, -1)
+        seasonality, level0, trend0 = model._init_additive_states(target, mask, idxs)
+
+        np.testing.assert_allclose(
+            seasonality.numpy().ravel(), season_profile, atol=1e-3
+        )
+        np.testing.assert_allclose(trend0.item(), trend_true, atol=1e-3)
+        np.testing.assert_allclose(level0.item(), level0_true, atol=1e-2)
+
+
+class TestAdditiveForward:
+    def test_forward_matches_manual_recursion(self):
+        """The additive forward pass must reproduce a hand-rolled Holt-Winters
+        additive (damped) recursion seeded with the same initial states."""
+        torch.manual_seed(0)
+        model = make_additive_model()
+        model.n_series = 1
+        n = 4 * M_A
+        dates = pd.date_range("2015-01-01", periods=n, freq="MS")
+        rng = np.random.RandomState(0)
+        months = np.asarray(dates.month)
+        y = 100 + 0.5 * np.arange(n) + 10 * np.sin(2 * np.pi * months / M_A) + rng.randn(n)
+
+        target = torch.tensor(y.reshape(1, -1), dtype=torch.float32)
+        mask = torch.ones_like(target)
+        idxs = torch.tensor(months - 1).reshape(1, -1)
+
+        alpha, beta, gamma, phi = 0.3, 0.2, 0.1, 0.95
+        params = torch.tensor([alpha, beta, gamma, phi]).repeat(1, n, 1)
+
+        data = FakeDataset(pd.DataFrame({"month": months}))
+        level_T, trend_T, seas_T, fits = model.forward(params, data, target, mask)
+        fits = torch.stack(fits, dim=1).numpy().ravel()
+
+        # Manual reference recursion with identical initial states
+        seas, l, b = model._init_additive_states(target, mask, idxs)
+        seas = seas.numpy().ravel().copy()
+        l, b = l.item(), b.item()
+        ref = [y[0]]
+        for t in range(1, n):
+            s = seas[months[t] - 1]
+            base = l + phi * b
+            ref.append(base + s)
+            l_new = alpha * (y[t] - s) + (1 - alpha) * base
+            b = beta * (l_new - l) + (1 - beta) * phi * b
+            seas[months[t] - 1] = gamma * (y[t] - base) + (1 - gamma) * s
+            l = l_new
+
+        np.testing.assert_allclose(fits, np.array(ref), rtol=1e-4, atol=1e-3)
+        np.testing.assert_allclose(level_T.item(), l, rtol=1e-4)
+        np.testing.assert_allclose(trend_T.item(), b, rtol=1e-4)
+
+
+class TestAdditiveTraining:
+    def test_train_forecast_shapes(self):
+        train, test = make_additive_panel()
+        model = make_additive_model()
+        result = model.train(lgb_params=LGB_PARAMS_A, num_iterations=20, train_data=train)
+        assert result.training_time is not None
+
+        fcst = model.forecast(test_data=test)
+        assert list(fcst.columns) == ["series_id", "date", "fcst", "model"]
+        assert len(fcst) == K_A * FCST_H_A
+        assert np.isfinite(fcst["fcst"]).all()
+        assert (fcst["model"] == "Hyper-Tree-ETS(additive)").all()
+
+    def test_handles_negative_values(self):
+        """The additive variant must handle series crossing zero, where the
+        multiplicative variant is undefined."""
+        train, test = make_additive_panel(offset=-120.0)
+        assert (train["value"] < 0).any() and (train["value"] > 0).any()
+        model = make_additive_model()
+        model.train(lgb_params=LGB_PARAMS_A, num_iterations=20, train_data=train)
+        fcst = model.forecast(test_data=test)
+        assert np.isfinite(fcst["fcst"]).all()
+
+    def test_forecast_accuracy_on_seasonal_panel(self):
+        """On clean additive-seasonal data the forecasts should track the
+        actuals closely."""
+        train, test = make_additive_panel(seed=3)
+        model = make_additive_model()
+        model.train(lgb_params=LGB_PARAMS_A, num_iterations=50, train_data=train)
+        fcst = model.forecast(test_data=test)
+        merged = fcst.merge(test[["series_id", "date", "value"]], on=["series_id", "date"])
+        smape = np.mean(
+            200.0 * np.abs(merged["value"] - merged["fcst"])
+            / (np.abs(merged["value"]) + np.abs(merged["fcst"]))
+        )
+        assert smape < 10.0
+
+    def test_parameters_output(self):
+        train, test = make_additive_panel()
+        model = make_additive_model()
+        model.train(lgb_params=LGB_PARAMS_A, num_iterations=10, train_data=train)
+        params = model.forecast(test_data=test, type="parameters")
+        assert list(params.columns) == ["series_id", "date", "model", "alpha", "beta", "gamma", "phi"]
+        for col in ["alpha", "beta", "gamma", "phi"]:
+            assert params[col].between(0, 1).all()
+
+    def test_conformal_intervals(self):
+        train, test = make_additive_panel()
+        model = make_additive_model()
+        model.train(
+            lgb_params=LGB_PARAMS_A, num_iterations=10, train_data=train,
+            forecast_intervals=ForecastIntervals(n_windows=2, refit=False),
+        )
+        fcst = model.forecast(test_data=test, level=[80])
+        lo, hi = "Hyper-Tree-ETS(additive)-lo-80", "Hyper-Tree-ETS(additive)-hi-80"
+        assert lo in fcst.columns and hi in fcst.columns
+        assert (fcst[lo] <= fcst["fcst"]).all()
+        assert (fcst["fcst"] <= fcst[hi]).all()
+
+    def test_validation_and_early_stopping(self):
+        train, _ = make_additive_panel()
+        model = make_additive_model()
+        result = model.train(
+            lgb_params=LGB_PARAMS_A, num_iterations=20, train_data=train,
+            validation=True, early_stopping_round=5,
+        )
+        assert "MSELoss" in result.validation_metrics
+        assert len(result.validation_metrics["MSELoss"]) > 0
+
+    def test_masked_padding_does_not_change_states(self):
+        """Back-padded pseudo-observations (mask == 0) must leave the final
+        states untouched."""
+        model = make_additive_model()
+        model.n_series = 1
+        n, pad = 3 * M_A, 5
+        dates = pd.date_range("2015-01-01", periods=n + pad, freq="MS")
+        rng = np.random.RandomState(1)
+        months = np.asarray(dates.month)
+        y = 100 + 10 * np.sin(2 * np.pi * months / M_A) + rng.randn(n + pad)
+        params = torch.tensor([0.3, 0.2, 0.1, 0.95]).repeat(1, n + pad, 1)
+
+        target_full = torch.tensor(y.reshape(1, -1), dtype=torch.float32)
+        mask_padded = torch.ones_like(target_full)
+        mask_padded[0, n:] = 0.0
+        data = FakeDataset(pd.DataFrame({"month": months}))
+        l_pad, b_pad, _, _ = model.forward(params, data, target_full, mask_padded)
+
+        target_short = target_full[:, :n]
+        mask_short = torch.ones_like(target_short)
+        data_short = FakeDataset(pd.DataFrame({"month": months[:n]}))
+        model._init_cache = {}
+        l_short, b_short, _, _ = model.forward(
+            params[:, :n], data_short, target_short, mask_short
+        )
+
+        np.testing.assert_allclose(l_pad.item(), l_short.item(), rtol=1e-5)
+        np.testing.assert_allclose(b_pad.item(), b_short.item(), rtol=1e-5)
