@@ -144,6 +144,12 @@ class HyperTreeTSB:
                 "and cannot grow trees. Use nn.HuberLoss or nn.SmoothL1Loss for an "
                 "MAE-like loss with usable curvature."
             )
+        if getattr(loss_fn, "reduction", "mean") == "none":
+            raise ValueError(
+                "loss_fn must use a scalar reduction ('mean' or 'sum'); "
+                "reduction='none' returns per-element losses that the "
+                "boosting objective cannot consume."
+            )
         if not isinstance(loss_fn, nn.MSELoss):
             warnings.warn(
                 f"Loss {type(loss_fn).__name__} is not nn.MSELoss. The Gauss-Newton "
@@ -169,6 +175,12 @@ class HyperTreeTSB:
         self.fcst_states = None         # Store final TSB states for forecasting
         self.n_hessian_probes = n_hessian_probes
         self._iter_count = 0            # Iteration counter for seeding Hessian probes
+        # Recursive h-step validation metric: the terminal (p, z) states from
+        # the "train" eval call are stashed in _eval_boundary and consumed by
+        # the "validation" eval call of the same boosting iteration
+        # (valid_sets order is [train, validation]); see eval_fn.
+        self._last_states = None
+        self._eval_boundary = None
 
         # Shared Gauss-Newton Hessian estimator
         self._gn_hessian = GaussNewtonHessian(loss_fn, n_hessian_probes, self.dtype)
@@ -297,15 +309,83 @@ class HyperTreeTSB:
         -------
         Tuple[str, float, bool]
             Name of the metric, value of the metric, and whether to maximize it.
+
+        Notes
+        -----
+        The validation metric is the **recursive h-step forecast** loss: the
+        classical flat TSB forecast ``p_T * z_T`` (from the training-window
+        terminal states) scored against the holdout. The naive in-sample
+        validation loss is degenerate -- the TSB fitted value at every
+        validation row collapses to a parameter-independent fixed point, so it
+        is ~0 for *any* parameters and early stopping selects noise. The
+        training metric remains the in-sample one-step fit.
         """
         is_higher_better = False  # Lower loss is better, so we don't maximize
+        dataset_name = self.dataset_references.get(id(eval_data), "unknown")
         target = torch.tensor(
             eval_data.get_label().reshape(self.n_series, -1),
             dtype=self.dtype
         )
+
+        if dataset_name == "validation" and self._eval_boundary is not None:
+            # Recursive h-step forecast metric. The terminal states were stashed
+            # during this same iteration's "train" eval call, so they come from
+            # the identical (post-update) model state.
+            loss = self._recursive_eval_loss(eval_data, target)
+            loss_val = loss.item()
+            if not np.isfinite(loss_val):
+                # A diverged state early in boosting would otherwise feed NaN to
+                # early stopping; report a large finite value (worst) instead.
+                loss_val = float(np.finfo(np.float32).max)
+            return self.loss_name, loss_val, is_higher_better
+
+        # Train metric (and validation fallback before the first boundary is
+        # stashed): the teacher-forced in-sample one-step loss.
         _, loss = self.get_params_loss(predt, target, eval_data)
+        if dataset_name == "train":
+            # Stash terminal states for the validation rollout that follows in
+            # this same iteration.
+            self._eval_boundary = self._last_states
 
         return self.loss_name, loss.item(), is_higher_better
+
+    def _recursive_eval_loss(
+            self,
+            eval_data: lgb.Dataset,
+            target: torch.Tensor,
+    ) -> torch.Tensor:
+        """Recursive h-step forecast loss for the validation split.
+
+        Mirrors deployment: the flat TSB forecast ``p_T * z_T`` (via the shared
+        :meth:`_roll_forecast` helper), starting from the training-window
+        terminal states stored in ``self._eval_boundary``, is scored against
+        the holdout. The forecast is independent of the horizon parameters, as
+        in the classical method. Padded holdout rows (mask == 0) are excluded.
+
+        Parameters
+        ----------
+        eval_data : lgb.Dataset
+            Validation dataset (provides the mask).
+        target : torch.Tensor
+            Holdout observations, shape ``(n_series, fcst_h)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar loss between the flat forecast and the holdout.
+        """
+        last_p, last_z = self._eval_boundary
+        point = self._roll_forecast(last_p, last_z, target.shape[1])
+
+        if "mask" in eval_data.data.columns:
+            mask = torch.tensor(
+                eval_data.data["mask"].values.reshape(self.n_series, -1),
+                dtype=self.dtype,
+            )
+        else:
+            mask = torch.ones_like(target)
+
+        return self.loss_fn(point * mask, target * mask)
 
     def get_params_loss(
             self,
@@ -366,8 +446,11 @@ class HyperTreeTSB:
             series_len = target.shape[1]
             mask = torch.ones((self.n_series, series_len), dtype=self.dtype)
 
-        # Forward pass to compute fitted values
-        _, _, fit = self.forward(params, target, mask)
+        # Forward pass to compute fitted values. Keep the terminal probability/
+        # size states so the recursive validation metric can roll the flat
+        # deployment forecast from the training-window boundary (see eval_fn).
+        last_p, last_z, fit = self.forward(params, target, mask)
+        self._last_states = (last_p, last_z)
 
         # Stack fitted values and compute loss with masking
         fit = torch.stack(fit, dim=1)
@@ -631,6 +714,8 @@ class HyperTreeTSB:
         self.is_trained = False
         self.fcst_states = None
         self.features = None
+        self._last_states = None
+        self._eval_boundary = None
         self._is_calibrated = False
         self._cs_scores = None
         self._cs_series_order = None
@@ -731,7 +816,7 @@ class HyperTreeTSB:
             result = TrainingResult(
                 train_metrics=evals_result["train"] if validation else {"loss": []},
                 validation_metrics=evals_result["validation"] if validation else None,
-                best_iteration=self.model.best_iteration-1 if hasattr(self.model, 'best_iteration') else num_iterations,
+                best_iteration=self.model.best_iteration if self.model.best_iteration > 0 else num_iterations,
                 training_time=training_time
             )
 
@@ -796,7 +881,38 @@ class HyperTreeTSB:
             any ``mask`` column), ordered by ``(series_id, date)`` with each
             series in a contiguous block and all series of equal length.
         """
+        validate_series_order(history, name="history")
         self._store_final_states(history)
+
+    def _roll_forecast(
+            self,
+            last_p: torch.Tensor,
+            last_z: torch.Tensor,
+            h: int,
+    ) -> torch.Tensor:
+        """Classical TSB forecast: flat ``p_T * z_T`` over ``h`` steps.
+
+        Shared by :meth:`forecast` and the recursive validation metric
+        (:meth:`_recursive_eval_loss`) so the deployed forecast and the
+        early-stopping metric cannot diverge. Future demand occurrence is
+        unobserved and the expected states propagate unchanged, so the forecast
+        is constant over the horizon and independent of the horizon parameters.
+
+        Parameters
+        ----------
+        last_p : torch.Tensor
+            Terminal probability state, shape ``(n_series,)``.
+        last_z : torch.Tensor
+            Terminal size state, shape ``(n_series,)``.
+        h : int
+            Number of horizon steps.
+
+        Returns
+        -------
+        torch.Tensor
+            Point forecasts, shape ``(n_series, h)``.
+        """
+        return (last_p * last_z).reshape(-1, 1).repeat(1, h)
 
     def forecast(
             self,
@@ -919,8 +1035,9 @@ class HyperTreeTSB:
                 last_p = torch.stack([self.fcst_states[series_id]['last_p'] for series_id in test_series_ids])
                 last_z = torch.stack([self.fcst_states[series_id]['last_z'] for series_id in test_series_ids])
 
-                # Classical TSB: flat forecast p_T * z_T over the horizon
-                point = (last_p * last_z).reshape(-1, 1).repeat(1, self.fcst_h)
+                # Classical TSB: flat forecast p_T * z_T over the horizon (via
+                # the shared recursion, also used by the validation metric).
+                point = self._roll_forecast(last_p, last_z, self.fcst_h)
 
                 # Create output dataframe
                 out_df = pd.DataFrame({

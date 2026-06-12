@@ -94,7 +94,7 @@ import lightgbm as lgb
 from ..utils import CustomLogger
 lgb.register_logger(CustomLogger())
 
-from ..utils import TrainingResult, validate_series_order, NoDeepcopyObjective
+from ..utils import TrainingResult, validate_series_order, NoDeepcopyObjective, DatasetReferences
 from ..conformal import (
     ForecastIntervals,
     validate_calibration_length,
@@ -284,6 +284,12 @@ class _HyperTreeVARBase:
                 "everywhere, so LightGBM's Newton boosting receives all-zero Hessians "
                 "and cannot grow trees. Use nn.HuberLoss or nn.SmoothL1Loss for an "
                 "MAE-like loss with usable curvature."
+            )
+        if getattr(loss_fn, "reduction", "mean") == "none":
+            raise ValueError(
+                "loss_fn must use a scalar reduction ('mean' or 'sum'); "
+                "reduction='none' returns per-element losses that the "
+                "boosting objective cannot consume."
             )
         if scaling not in (None, "mean", "standard"):
             raise ValueError("scaling must be one of None, 'mean', or 'standard'.")
@@ -580,7 +586,9 @@ class _HyperTreeVARBase:
             free_raw_data=free_raw_data,
         )
 
-        self.dataset_references = {id(dtrain): "train"}
+        # Pinned mapping: a key hit proves it is that exact, still-alive
+        # dataset (see utils.DatasetReferences).
+        self.dataset_references = DatasetReferences([(dtrain, "train")])
 
         if validation:
             label_eval = Y[self.p + t_train:].T.ravel()
@@ -593,7 +601,9 @@ class _HyperTreeVARBase:
                 label=label_eval,
                 free_raw_data=free_raw_data,
             )
-            self.dataset_references[id(deval)] = "validation"
+            self.dataset_references = DatasetReferences(
+                [(dtrain, "train"), (deval, "validation")]
+            )
 
             evals_result = {}
             callbacks = [lgb.record_evaluation(evals_result)]
@@ -749,8 +759,8 @@ class _HyperTreeVARBase:
             return TrainingResult(
                 train_metrics=evals_result["train"] if validation else {"loss": []},
                 validation_metrics=evals_result["validation"] if validation else None,
-                best_iteration=self.model.best_iteration - 1
-                if hasattr(self.model, "best_iteration") else num_iterations,
+                best_iteration=self.model.best_iteration
+                if self.model.best_iteration > 0 else num_iterations,
                 training_time=training_time,
             )
 

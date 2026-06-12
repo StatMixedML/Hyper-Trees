@@ -79,6 +79,10 @@ class MLP(nn.Module):
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, output_dim),
+            # Dropout deliberately sits after the output layer, as specified
+            # in the paper (Section 2.2, footnote on the MLP architecture):
+            # it randomly zeros individual target-model coefficients during
+            # training, acting as parameter regularization.
             nn.Dropout(dropout_rate)
         ])
 

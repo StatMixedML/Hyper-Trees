@@ -37,6 +37,7 @@ that returns a fresh model exposing the standard Hyper-Tree ``train`` / ``foreca
 interface, so it can be reused for the other Hyper-Tree models in the future.
 """
 
+import warnings
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Sequence, Tuple
 
@@ -227,6 +228,26 @@ def rolling_origin_residuals(
 
         fcst = model.forecast(test_data=test_df, type="forecast")
 
+        # Residuals are computed positionally; enforce the row-order contract
+        # (one forecast row per input row, in input order) so a model that
+        # reorders or reshapes its output fails loudly instead of silently
+        # mis-assigning residuals across series.
+        if not (
+            np.array_equal(
+                fcst["series_id"].to_numpy(), test_df["series_id"].to_numpy()
+            )
+            and np.array_equal(
+                pd.to_datetime(fcst["date"]).to_numpy(),
+                pd.to_datetime(test_df["date"]).to_numpy(),
+            )
+        ):
+            raise RuntimeError(
+                "model.forecast() returned rows in a different order than "
+                "test_data. rolling_origin_residuals computes residuals "
+                "positionally and requires one forecast row per input row, "
+                "in input order."
+            )
+
         resid = np.abs(fcst["fcst"].to_numpy() - test_df["value"].to_numpy())
         if "mask" in test_df.columns:
             # Padded pseudo-observations (mask == 0, used by HyperTreeETS for
@@ -326,6 +347,19 @@ def interval_columns(
     for lv in levels:
         if not 0 < lv < 100:
             raise ValueError(f"level values must be in (0, 100); got {lv}.")
+
+    # With few calibration windows, high-level tail quantiles sit at the
+    # extremes of the available scores and the intervals will undercover.
+    n_windows = scores.shape[0]
+    for lv in levels:
+        if n_windows * (100 - lv) < 100:
+            warnings.warn(
+                f"level={lv} requires tail quantiles beyond the resolution of "
+                f"n_windows={n_windows} conformity scores per series and "
+                f"horizon step; the bounds then sit at the extremes of the "
+                f"scores and the interval will likely undercover. Increase "
+                f"ForecastIntervals(n_windows=...) or request a lower level."
+            )
 
     scores = _align_scores(scores, cal_order, target_order)
 

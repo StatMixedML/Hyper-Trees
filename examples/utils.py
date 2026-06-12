@@ -1,6 +1,8 @@
 import numpy as np
 import pandas as pd
 import re
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 
 def calculate_metrics(
@@ -636,3 +638,62 @@ def mean_interval_width(
 
     return float(np.mean(hi - lo))
 
+
+def plot_stl(
+    df,
+    date_col="date",
+    cols=("trend", "seasonality"),
+    group_col="model",
+    base_size=14,
+    figsize=(10, 5),
+):
+    """Stacked plot of the trend and seasonality columns, one panel each.
+
+    Expects a long DataFrame with a date column, one numeric column per
+    component, and an optional grouping column (``model``) that gets one line
+    per level. Complexity is O(n) per column, trivial next to the upstream
+    decomposition.
+
+    Assumes a single ``series_id`` per call. If several series are stacked in
+    the frame, filter to one first or the lines will connect unrelated points.
+
+    Returns
+    -------
+    (fig, axes)
+    """
+    df = df.copy()
+    df[date_col] = pd.to_datetime(df[date_col])
+
+    has_groups = group_col in df.columns and df[group_col].nunique() > 1
+
+    fig, axes = plt.subplots(
+        nrows=len(cols), ncols=1, sharex=True,
+        figsize=figsize, constrained_layout=True,
+    )
+    axes = [axes] if len(cols) == 1 else list(axes)
+
+    for ax, col in zip(axes, cols):
+        if has_groups:
+            for key, g in df.groupby(group_col):
+                g = g.sort_values(date_col)
+                ax.plot(g[date_col], g[col], linewidth=1.4, label=str(key))
+        else:
+            g = df.sort_values(date_col)
+            ax.plot(g[date_col], g[col], linewidth=1.4, color="#1f77b4")
+
+        ax.set_ylabel(col.capitalize(), fontsize=base_size)
+        ax.grid(True, color="grey", alpha=0.12, linewidth=0.6)
+        ax.tick_params(labelsize=base_size * 0.8)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("black")
+            spine.set_linewidth(0.8)
+
+    if has_groups:
+        axes[0].legend(frameon=True, fontsize=base_size * 0.7)
+
+    x = df[date_col]
+    span_years = max(1.0, (x.max() - x.min()).days / 365.0)
+    step = max(1, round(span_years / 8))
+    axes[-1].xaxis.set_major_locator(mdates.YearLocator(base=step))
+    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    fig.suptitle("Hyper-Tree-STL Decomposition", fontsize=base_size * 1.1)

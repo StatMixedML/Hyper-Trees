@@ -1,6 +1,6 @@
 """Tests for the Hyper-Tree-TSB intermittent demand model."""
 
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pandas as pd
@@ -372,3 +372,77 @@ class TestTSBForecastValidation:
         model, test = _trained()
         with pytest.raises(RuntimeError, match="Missing features"):
             model.forecast(test_data=test.drop(columns=["month"]))
+
+
+class TestTSBRecursiveValidationMetric:
+    """The validation metric is the recursive h-step forecast (flat p_T * z_T
+    scored against the holdout), not the degenerate in-sample one-step fit.
+
+    The naive in-sample validation loss collapses to a parameter-independent
+    fixed point (~0 for any parameters), so early stopping would select noise.
+    These tests pin the fix: the validation curve is on a meaningful scale and
+    varies with the boosted states, and the recursive branch reproduces the
+    shared flat-forecast rollout used by ``forecast``.
+    """
+
+    def test_validation_metric_is_not_degenerate(self):
+        train, _ = make_panel()
+        model = HyperTreeTSB(freq="W", fcst_h=FCST_H)
+        result = model.train(
+            lgb_params=LGB_PARAMS, num_iterations=25, train_data=train,
+            validation=True, early_stopping_round=999,
+        )
+        vals = np.asarray(next(iter(result.validation_metrics.values())), dtype=float)
+        assert vals.size >= 5
+        assert np.all(np.isfinite(vals))
+        # Not the ~1e-12 degenerate in-sample metric: forecasting flat demand
+        # against an intermittent holdout gives a clearly non-zero MSE.
+        assert vals.min() > 1e-3
+        # The metric depends on the boosted terminal states, so it moves.
+        assert np.ptp(vals) > 1e-9
+
+    def test_eval_fn_recursive_branch_matches_flat_forecast(self):
+        model = HyperTreeTSB(freq="W", fcst_h=3)
+        model.n_series = 2
+        last_p = torch.tensor([0.3, 0.5])
+        last_z = torch.tensor([6.0, 4.0])
+        model._eval_boundary = (last_p, last_z)
+
+        val_df = pd.DataFrame({"month": [1, 2, 3, 1, 2, 3],
+                               "mask": [1, 1, 1, 1, 1, 1]})
+        target = np.array([[0.0, 7.0, 0.0], [5.0, 0.0, 8.0]])
+        mock_eval = Mock()
+        mock_eval.data = val_df
+        mock_eval.get_label.return_value = target.reshape(-1)
+        model.dataset_references = {id(mock_eval): "validation"}
+
+        # predt is ignored by the flat TSB forecast (independent of horizon params).
+        predt = np.zeros(model.n_series * model.fcst_h * model.n_params)
+        name, loss_val, is_higher_better = model.eval_fn(predt, mock_eval)
+
+        point = model._roll_forecast(last_p, last_z, 3)
+        exp_loss = nn.MSELoss()(point, torch.tensor(target, dtype=torch.float32)).item()
+
+        assert name == "MSELoss"
+        assert is_higher_better is False
+        assert abs(loss_val - exp_loss) < 1e-5
+
+    def test_validation_mask_excludes_padding(self):
+        """Padded holdout rows (mask == 0) must not contribute to the metric."""
+        model = HyperTreeTSB(freq="W", fcst_h=3)
+        model.n_series = 1
+        model._eval_boundary = (torch.tensor([0.4]), torch.tensor([5.0]))
+
+        val_df = pd.DataFrame({"month": [1, 2, 3], "mask": [1, 1, 0]})
+        target = np.array([[3.0, 0.0, 999.0]])  # last row padded; must be ignored
+        mock_eval = Mock()
+        mock_eval.data = val_df
+        mock_eval.get_label.return_value = target.reshape(-1)
+        model.dataset_references = {id(mock_eval): "validation"}
+
+        _, loss_val, _ = model.eval_fn(np.zeros(model.n_params * 3), mock_eval)
+
+        point = float((0.4 * 5.0))
+        # Only the two valid rows count (3 and 0); the padded 999 is masked out.
+        expected = ((point - 3.0) ** 2 + (point - 0.0) ** 2 + 0.0) / 3.0
+        assert abs(loss_val - expected) < 1e-5

@@ -309,7 +309,7 @@ class TestHyperTreeARTraining:
         assert isinstance(result, TrainingResult)
         assert result.train_metrics == {'loss': []}
         assert result.validation_metrics is None
-        assert result.best_iteration == 9  # best_iteration-1 in implementation
+        assert result.best_iteration == 10  # model.best_iteration when > 0
         assert result.training_time is not None
         
     @patch('hypertrees.models.HyperTreeAR.lgb.train')

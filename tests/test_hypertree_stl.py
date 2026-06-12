@@ -191,6 +191,9 @@ class TestHyperTreeSTLTraining:
     @patch("hypertrees.models.HyperTreeSTL.TimeSeriesPreprocessor")
     def test_successful_training(self, mock_preprocessor, mock_prepare_datasets, mock_lgb_train, sample_train_data):
         model = HyperTreeSTL(period=12, num_seasonal_components=1)
+        # The post-training seasonal-offset anchoring predicts with the model;
+        # stub it out since lgb.train is mocked (no real booster to predict with).
+        model._compute_seasonal_offset = Mock(return_value=0.0)
 
         # Mock preprocessor to return the same data and expose features incl. time_idx
         mock_pre = Mock()
@@ -223,7 +226,7 @@ class TestHyperTreeSTLTraining:
         assert isinstance(result, TrainingResult)
         assert result.train_metrics == {"loss": []}
         assert result.validation_metrics is None
-        assert result.best_iteration == 10  # best_iteration-1
+        assert result.best_iteration == 11  # model.best_iteration when > 0
         assert result.training_time is not None
 
 
@@ -305,7 +308,7 @@ class TestHyperTreeSTLForecasting:
         assert isinstance(result, pd.DataFrame)
         assert set(["series_id", "date", "fcst", "model"]).issubset(result.columns)
         assert len(result) == len(sample_test_data)
-        assert result["model"].iloc[0] == f"Hyper-Tree-STL(period={trained_model.period})"
+        assert result["model"].iloc[0] == f"Hyper-Tree-STL({trained_model.period})"
 
     def test_forecast_components_output(self, trained_model, sample_test_data):
         result = trained_model.forecast(test_data=sample_test_data, type="components")
@@ -327,7 +330,7 @@ class TestHyperTreeSTLForecasting:
         }
         assert expected_cols.issubset(result.columns)
         assert len(result) == len(sample_test_data)
-        assert result["model"].iloc[0] == f"Hyper-Tree-STL(period={trained_model.period})"
+        assert result["model"].iloc[0] == f"Hyper-Tree-STL({trained_model.period})"
         # Basic sanity: parameter columns contain numeric values and no NaNs
         params_df = result[[
             "trend_intercept",

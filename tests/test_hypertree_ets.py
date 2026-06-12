@@ -238,7 +238,7 @@ class TestHyperTreeETSTraining:
         assert isinstance(result, TrainingResult)
         assert result.train_metrics == {"loss": []}
         assert result.validation_metrics is None
-        assert result.best_iteration == (6 if hasattr(mock_model, "best_iteration") else 10)
+        assert result.best_iteration == 7  # model.best_iteration when > 0
         assert result.training_time is not None
         mock_store_states.assert_called_once()
 
@@ -1305,3 +1305,119 @@ class TestAdditiveTraining:
 
         np.testing.assert_allclose(l_pad.item(), l_short.item(), rtol=1e-5)
         np.testing.assert_allclose(b_pad.item(), b_short.item(), rtol=1e-5)
+
+
+class TestHyperTreeETSRecursiveValidationMetric:
+    """The validation metric is the recursive h-step forecast, not the
+    degenerate in-sample one-step fit.
+
+    For the seasonal variants with ``fcst_h <= season_length`` the in-sample
+    validation loss collapses to a parameter-independent fixed point (~0 for any
+    parameters), so early stopping would select noise. These tests pin the fix:
+    the validation curve is on a meaningful scale and varies with the boosted
+    parameters/states, and the recursive branch matches the shared
+    ``_roll_forecast`` rollout used by ``forecast``.
+    """
+
+    LGB_PARAMS = {"learning_rate": 0.1, "num_leaves": 15,
+                  "min_data_in_leaf": 1, "min_data_in_bin": 1}
+
+    def _seasonal_panel(self, n_series=3, n_periods=48, freq="MS"):
+        rng = np.random.default_rng(7)
+        dates = pd.date_range("2015-01-01", periods=n_periods, freq=freq)
+        t = np.arange(n_periods)
+        frames = []
+        for sid in range(n_series):
+            seasonal = 10.0 * np.sin(2 * np.pi * (dates.month - 1) / 12.0)
+            value = 100.0 + 0.5 * t + seasonal + rng.standard_normal(n_periods)
+            frames.append(pd.DataFrame({
+                "series_id": sid, "date": dates, "value": value,
+                "month": dates.month, "feature1": rng.standard_normal(n_periods),
+            }))
+        return pd.concat(frames, ignore_index=True)
+
+    @pytest.mark.parametrize("ets_type", ["triple", "additive"])
+    def test_validation_metric_is_not_degenerate(self, ets_type):
+        """fcst_h == season_length is the exact-degenerate case; the recursive
+        metric must be on the data scale and move across iterations."""
+        train = self._seasonal_panel()
+        model = HyperTreeETS(ets_type=ets_type, season_length=12,
+                             seasonality_feature="month", freq="M", fcst_h=12)
+        result = model.train(
+            lgb_params=self.LGB_PARAMS, num_iterations=25, train_data=train,
+            validation=True, early_stopping_round=999,
+        )
+        vals = np.asarray(next(iter(result.validation_metrics.values())), dtype=float)
+        assert vals.size >= 5
+        assert np.all(np.isfinite(vals))
+        # Not the ~1e-12 degenerate in-sample metric: forecast errors on a
+        # ~100-scale seasonal series give an MSE far above any rounding floor.
+        assert vals.min() > 1e-2
+        # The metric depends on the boosted parameters/states, so it moves.
+        assert np.ptp(vals) > 1e-6
+
+    def test_train_and_validation_metrics_differ(self):
+        """The train metric stays teacher-forced in-sample; the validation
+        metric is the recursive forecast, so the two curves are not identical."""
+        train = self._seasonal_panel()
+        model = HyperTreeETS(ets_type="triple", season_length=12,
+                             seasonality_feature="month", freq="M", fcst_h=12)
+        result = model.train(
+            lgb_params=self.LGB_PARAMS, num_iterations=20, train_data=train,
+            validation=True, early_stopping_round=999,
+        )
+        train_vals = np.asarray(next(iter(result.train_metrics.values())), dtype=float)
+        val_vals = np.asarray(next(iter(result.validation_metrics.values())), dtype=float)
+        assert not np.allclose(train_vals, val_vals)
+
+    def test_eval_fn_recursive_branch_matches_roll_forecast(self):
+        """The validation branch of eval_fn reproduces the shared rollout used
+        by forecast (correct F-order predt reshape and masking)."""
+        model = HyperTreeETS(ets_type="triple", season_length=4,
+                             seasonality_feature="month", fcst_h=3)
+        model.n_series = 2
+        level = torch.tensor([100.0, 50.0])
+        trend = torch.tensor([1.0, -0.5])
+        seas = torch.tensor([[1.1, 0.9, 1.05, 0.95], [1.2, 0.8, 1.1, 0.9]])
+        model._eval_boundary = (level, trend, seas)
+
+        val_df = pd.DataFrame({"month": [1, 2, 3, 1, 2, 3],
+                               "mask": [1, 1, 1, 1, 1, 1]})
+        target = np.array([[101.0, 102.0, 103.0], [49.0, 48.0, 47.0]])
+        mock_eval = Mock()
+        mock_eval.data = val_df
+        mock_eval.get_label.return_value = target.reshape(-1)
+        model.dataset_references = {id(mock_eval): "validation"}
+
+        rng = np.random.default_rng(0)
+        predt = rng.standard_normal(model.n_series * model.fcst_h * model.n_params)
+        name, loss_val, is_higher_better = model.eval_fn(predt, mock_eval)
+
+        params = torch.clamp(
+            torch.sigmoid(torch.tensor(
+                predt.reshape(-1, model.n_params, order="F"), dtype=torch.float32
+            ).reshape(model.n_series, -1, model.n_params)),
+            min=model.eps, max=1 - model.eps,
+        )
+        idxs = (torch.tensor(val_df["month"].values).reshape(model.n_series, -1).long() - 1)
+        expected = model._roll_forecast(level, trend, seas, params, idxs)
+        target_t = torch.tensor(target, dtype=torch.float32)
+        exp_loss = nn.MSELoss()(expected, target_t).item()
+
+        assert name == "MSELoss"
+        assert is_higher_better is False
+        assert abs(loss_val - exp_loss) < 1e-5
+
+    def test_roll_forecast_does_not_mutate_seasonality(self):
+        """The shared rollout must clone seasonality so repeated calls (forecast
+        plus the validation metric) are independent."""
+        model = HyperTreeETS(ets_type="triple", season_length=4,
+                             seasonality_feature="month", fcst_h=3)
+        model.n_series = 1
+        seas = torch.tensor([[1.1, 0.9, 1.05, 0.95]])
+        seas_before = seas.clone()
+        params = torch.full((1, 3, 4), 0.3)
+        idxs = torch.tensor([[0, 1, 2]])
+        model._roll_forecast(torch.tensor([100.0]), torch.tensor([1.0]),
+                             seas, params, idxs)
+        assert torch.allclose(seas, seas_before)

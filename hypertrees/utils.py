@@ -307,6 +307,28 @@ class TimeSeriesPreprocessor:
         return preprocessed_df
 
 
+class DatasetReferences(dict):
+    """``id(dataset) -> name`` mapping that also pins the datasets.
+
+    The mapping is keyed by object identity, which is only stable while the
+    datasets stay alive: once a dataset is garbage-collected, CPython can
+    reuse its memory address, and a later object would silently inherit its
+    entry (observed as ``eval_fn`` misclassifying a foreign dataset as
+    "train" instead of warning). Holding strong references means a key hit
+    proves it is that exact, still-alive dataset -- the same pinning argument
+    as HyperTreeETS's init cache. Behaves as a plain dict otherwise.
+
+    Parameters
+    ----------
+    pairs : list of (lgb.Dataset, str)
+        Datasets and their names ("train" / "validation").
+    """
+
+    def __init__(self, pairs):
+        super().__init__({id(ds): name for ds, name in pairs})
+        self._pinned = [ds for ds, _ in pairs]
+
+
 def prepare_datasets(
     full_ts: pd.DataFrame,
     preprocessor: Any,  # TimeSeriesPreprocessor
@@ -403,9 +425,10 @@ def prepare_datasets(
         valid_sets = [dtrain, deval]
         valid_names = ["train", "validation"]
 
-        # Store dataset references with names
-        dataset_references[id(dtrain)] = valid_names[0]
-        dataset_references[id(deval)] = valid_names[1]
+        # Store dataset references with names (pinned so the ids stay valid)
+        dataset_references = DatasetReferences(
+            [(dtrain, valid_names[0]), (deval, valid_names[1])]
+        )
 
         if early_stopping_round is not None:
             callbacks.append(
@@ -428,7 +451,7 @@ def prepare_datasets(
         dtrain = lgb.Dataset(data=features_full, label=target_full.reshape(-1, ), free_raw_data=free_raw_data)
         valid_sets = [dtrain]
         valid_names = ["train"]
-        dataset_references[id(dtrain)] = valid_names[0]
+        dataset_references = DatasetReferences([(dtrain, valid_names[0])])
 
         return valid_sets, valid_names, None, None, lags_train, None, dataset_references
 
@@ -557,3 +580,4 @@ class GaussNewtonHessian:
             Jt_z = autograd((z * sqrt_curv * fit).sum(), params, retain_graph=True)[0]
             hess_sum += Jt_z ** 2
         return hess_sum / self.n_probes
+

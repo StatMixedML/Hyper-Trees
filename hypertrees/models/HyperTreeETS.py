@@ -167,6 +167,12 @@ class HyperTreeETS:
                 "and cannot grow trees. Use nn.HuberLoss or nn.SmoothL1Loss for an "
                 "MAE-like loss with usable curvature."
             )
+        if getattr(loss_fn, "reduction", "mean") == "none":
+            raise ValueError(
+                "loss_fn must use a scalar reduction ('mean' or 'sum'); "
+                "reduction='none' returns per-element losses that the "
+                "boosting objective cannot consume."
+            )
         if not isinstance(loss_fn, nn.MSELoss):
             warnings.warn(
                 f"Loss {type(loss_fn).__name__} is not nn.MSELoss. The Gauss-Newton "
@@ -199,6 +205,12 @@ class HyperTreeETS:
         self.n_hessian_probes = n_hessian_probes
         self._iter_count = 0            # Iteration counter for seeding Hessian probes
         self._init_cache = {}           # Per-dataset cache of _init_triple_states results
+        # Recursive h-step validation metric: the terminal level/trend/seasonality
+        # states from the "train" eval call are stashed in _eval_boundary and
+        # consumed by the "validation" eval call of the same boosting iteration
+        # (valid_sets order is [train, validation]); see eval_fn.
+        self._last_states = None
+        self._eval_boundary = None
 
         # Shared Gauss-Newton Hessian estimator
         self._gn_hessian = GaussNewtonHessian(loss_fn, n_hessian_probes, self.dtype)
@@ -518,16 +530,109 @@ class HyperTreeETS:
         -------
         Tuple[str, float, bool]
             Name of the metric, value of the metric, and whether to maximize it.
+
+        Notes
+        -----
+        The validation metric is the **recursive h-step forecast** loss, not the
+        in-sample one-step fit. Rolling the deployment recursion from the
+        training-window terminal states and scoring against the holdout measures
+        the quantity the model is actually used for. The naive in-sample
+        validation loss is degenerate for the seasonal variants when
+        ``fcst_h <= season_length`` (every state update becomes a
+        parameter-independent fixed point, so the loss is ~0 for *any*
+        parameters and early stopping selects noise). The training metric
+        remains the in-sample one-step fit.
         """
-        # Calculate loss
         is_higher_better = False  # Lower loss is better, so we don't maximize
+        dataset_name = self.dataset_references.get(id(eval_data), "unknown")
         target = torch.tensor(
             eval_data.get_label().reshape(self.n_series, -1),
             dtype=self.dtype
         )
+
+        if dataset_name == "validation" and self._eval_boundary is not None:
+            # Recursive h-step forecast metric. The terminal states were stashed
+            # during this same iteration's "train" eval call, so the boundary
+            # states and the horizon parameters come from the identical model
+            # state (no off-by-one tree).
+            loss = self._recursive_eval_loss(predt, eval_data, target)
+            loss_val = loss.item()
+            if not np.isfinite(loss_val):
+                # A diverged rollout early in boosting would otherwise feed NaN
+                # to early stopping; report a large finite value (worst) instead.
+                loss_val = float(np.finfo(np.float32).max)
+            return self.loss_name, loss_val, is_higher_better
+
+        # Train metric (and validation fallback before the first boundary is
+        # stashed): the teacher-forced in-sample one-step loss.
         _, loss = self.get_params_loss(predt, target, eval_data)
+        if dataset_name == "train":
+            # Stash terminal states for the validation rollout that follows in
+            # this same iteration.
+            self._eval_boundary = self._last_states
 
         return self.loss_name, loss.item(), is_higher_better
+
+    def _recursive_eval_loss(
+            self,
+            predt: np.ndarray,
+            eval_data: lgb.Dataset,
+            target: torch.Tensor,
+    ) -> torch.Tensor:
+        """Recursive h-step forecast loss for the validation split.
+
+        Mirrors deployment: the predicted parameters over the validation window
+        drive the same rolled recursion as :meth:`forecast` (via the shared
+        :meth:`_roll_forecast` helper), starting from the training-window
+        terminal states stored in ``self._eval_boundary``. Padded holdout rows
+        (mask == 0) are excluded from the loss.
+
+        Parameters
+        ----------
+        predt : np.ndarray
+            Raw LightGBM outputs over the validation rows (class-major order).
+        eval_data : lgb.Dataset
+            Validation dataset (provides the seasonality feature and mask).
+        target : torch.Tensor
+            Holdout observations, shape ``(n_series, fcst_h)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar loss between the rolled forecasts and the holdout.
+        """
+        params = torch.clamp(
+            self.sigmoid_fn(
+                torch.tensor(
+                    predt.reshape(-1, self.n_params, order="F"),
+                    dtype=self.dtype,
+                ).reshape(self.n_series, -1, self.n_params)
+            ),
+            min=self.eps,
+            max=1 - self.eps,
+        )
+
+        level_h, trend_h, seasonality = self._eval_boundary
+        if self.ets_type in ("triple", "additive"):
+            seasonality_idxs = self._seasonal_positions(
+                eval_data.data[self.seasonality_feature].values
+            ).reshape(self.n_series, -1)
+        else:
+            seasonality_idxs = None
+
+        fcsts = self._roll_forecast(
+            level_h, trend_h, seasonality, params, seasonality_idxs
+        )
+
+        if "mask" in eval_data.data.columns:
+            mask = torch.tensor(
+                eval_data.data["mask"].values.reshape(self.n_series, -1),
+                dtype=self.dtype,
+            )
+        else:
+            mask = torch.ones_like(target)
+
+        return self.loss_fn(fcsts * mask, target * mask)
 
     def get_params_loss(
             self,
@@ -588,8 +693,12 @@ class HyperTreeETS:
             series_len = target.shape[1]
             mask = torch.ones((self.n_series, series_len), dtype=self.dtype)
 
-        # Forward pass to compute fitted values
-        _, _, _, fit = self.forward(params, data, target, mask)
+        # Forward pass to compute fitted values. Keep the terminal level/
+        # trend/seasonality states so the recursive validation metric can roll
+        # the deployment recursion forward from the training-window boundary
+        # (see eval_fn / _recursive_eval_loss).
+        last_level, last_trend, seasonality, fit = self.forward(params, data, target, mask)
+        self._last_states = (last_level, last_trend, seasonality)
 
         # Stack fitted values and compute loss with masking
         fit = torch.stack(fit, dim=1)
@@ -1014,10 +1123,15 @@ class HyperTreeETS:
         alpha_t = alpha.unbind(dim=1)
         beta_t = beta.unbind(dim=1)
 
-        # Initialize states for trend model
+        # Initialize states for the trend model. With back-appended padding
+        # the slope endpoint must be the last *valid* observation inside the
+        # window, not a padded value, so the endpoint index is mask-aware.
         level_prev = target[:, 0]
-        last_idx = min(2 * self.season_length - 1, series_len - 1)
-        trend_prev = (target[:, last_idx] - target[:, 0]) / max(last_idx, 1)
+        cap = min(2 * self.season_length - 1, series_len - 1)
+        n_valid = mask[:, :cap + 1].sum(dim=1).to(torch.long)
+        last_idx = (n_valid - 1).clamp(min=0)
+        endpoint = target.gather(1, last_idx.unsqueeze(1)).squeeze(1)
+        trend_prev = (endpoint - level_prev) / last_idx.to(self.dtype).clamp(min=1.0)
         fits = [target[:, 0]]
 
         # Pre-unbind the data tensors so the loop indexes Python tuples
@@ -1244,6 +1358,8 @@ class HyperTreeETS:
         self.is_trained = False
         self.fcst_states = None
         self.features = None
+        self._last_states = None
+        self._eval_boundary = None
         self._is_calibrated = False
         self._cs_scores = None
         self._cs_series_order = None
@@ -1349,7 +1465,7 @@ class HyperTreeETS:
             result = TrainingResult(
                 train_metrics=evals_result["train"] if validation else {"loss": []},
                 validation_metrics=evals_result["validation"] if validation else None,
-                best_iteration=self.model.best_iteration-1 if hasattr(self.model, 'best_iteration') else num_iterations,
+                best_iteration=self.model.best_iteration if self.model.best_iteration > 0 else num_iterations,
                 training_time=training_time
             )
 
@@ -1429,7 +1545,140 @@ class HyperTreeETS:
             ``(series_id, date)`` with each series in a contiguous block and
             all series of equal length.
         """
+        validate_series_order(history, name="history")
         self._store_final_states(history)
+
+    def _roll_forecast(
+            self,
+            level_h: torch.Tensor,
+            trend_h: torch.Tensor,
+            seasonality: Optional[torch.Tensor],
+            params: torch.Tensor,
+            seasonality_idxs: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Roll the ETS deployment recursion forward from terminal states.
+
+        Shared by :meth:`forecast` and the recursive validation metric
+        (:meth:`_recursive_eval_loss`) so the deployed forecast and the
+        early-stopping metric can never diverge. Each step's own one-step fit
+        serves as the pseudo-observation in the state updates (future
+        innovations are zero in expectation), exactly mirroring the training
+        forward passes. The caller's ``seasonality`` is cloned, not mutated.
+
+        Parameters
+        ----------
+        level_h : torch.Tensor
+            Terminal level state at the forecast origin, shape ``(n_series,)``.
+        trend_h : torch.Tensor
+            Terminal trend state at the forecast origin, shape ``(n_series,)``.
+        seasonality : torch.Tensor or None
+            Terminal seasonal states, shape ``(n_series, season_length)``;
+            ``None`` for ``ets_type="trend"``.
+        params : torch.Tensor
+            Sigmoid-transformed ETS parameters per horizon step,
+            shape ``(n_series, H, n_params)``.
+        seasonality_idxs : torch.Tensor or None
+            0-based seasonal slot per horizon step, shape ``(n_series, H)``;
+            ``None`` for ``ets_type="trend"``.
+
+        Returns
+        -------
+        torch.Tensor
+            Point forecasts, shape ``(n_series, H)``.
+        """
+        H = params.shape[1]
+        n_series = params.shape[0]
+        batch_idx = torch.arange(n_series, dtype=torch.long)
+        level_h = level_h.clone()
+        trend_h = trend_h.clone()
+        if seasonality is not None:
+            seasonality = seasonality.clone()
+        fcsts = []
+
+        if self.ets_type == "triple":
+            for h in range(H):
+                alpha = params[:, h, 0]
+                beta = params[:, h, 1]
+                gamma = params[:, h, 2]
+                phi = params[:, h, 3]
+                s_idx = seasonality_idxs[:, h].long()
+                s_h = seasonality[batch_idx, s_idx]
+
+                # One-step-ahead fit (pseudo-observation),
+                # structurally identical to _forward_triple.
+                pseudo_y = (level_h + phi * trend_h) * s_h
+                fcsts.append(pseudo_y.reshape(-1, 1))
+
+                # State updates exactly as in _forward_triple.
+                level_new = (
+                    alpha * (pseudo_y / s_h)
+                    + (1 - alpha) * (level_h + phi * trend_h)
+                )
+                trend_new = (
+                    beta * (level_new - level_h)
+                    + (1 - beta) * phi * trend_h
+                )
+                seasonality[batch_idx, s_idx] = (
+                    gamma * (pseudo_y / (level_h + phi * trend_h))
+                    + (1 - gamma) * s_h
+                )
+                level_h = level_new
+                trend_h = trend_new
+
+        elif self.ets_type == "additive":
+            for h in range(H):
+                alpha = params[:, h, 0]
+                beta = params[:, h, 1]
+                gamma = params[:, h, 2]
+                phi = params[:, h, 3]
+                s_idx = seasonality_idxs[:, h].long()
+                s_h = seasonality[batch_idx, s_idx]
+
+                # One-step-ahead fit (pseudo-observation),
+                # structurally identical to _forward_additive.
+                pred_base = level_h + phi * trend_h
+                pseudo_y = pred_base + s_h
+                fcsts.append(pseudo_y.reshape(-1, 1))
+
+                # State updates exactly as in _forward_additive.
+                level_new = (
+                    alpha * (pseudo_y - s_h)
+                    + (1 - alpha) * pred_base
+                )
+                trend_new = (
+                    beta * (level_new - level_h)
+                    + (1 - beta) * phi * trend_h
+                )
+                seasonality[batch_idx, s_idx] = (
+                    gamma * (pseudo_y - pred_base)
+                    + (1 - gamma) * s_h
+                )
+                level_h = level_new
+                trend_h = trend_new
+
+        elif self.ets_type == "trend":
+            for h in range(H):
+                alpha = params[:, h, 0]
+                beta = params[:, h, 1]
+
+                # One-step-ahead fit (pseudo-observation),
+                # structurally identical to _forward_trend.
+                pseudo_y = level_h + trend_h
+                fcsts.append(pseudo_y.reshape(-1, 1))
+
+                # State updates exactly as in _forward_trend.
+                level_new = (
+                    alpha * pseudo_y
+                    + (1 - alpha) * (level_h + trend_h)
+                )
+                trend_new = (
+                    beta * (level_new - level_h)
+                    + (1 - beta) * trend_h
+                )
+                level_h = level_new
+                trend_h = trend_new
+
+        return torch.cat(fcsts, dim=1)
 
     def forecast(
             self,
@@ -1447,6 +1696,14 @@ class HyperTreeETS:
 
         The forecasting process rolls the ETS state-space recursion forward,
         mirroring the training forward pass.
+
+        Note that the pseudo-observation rollout collapses algebraically: the
+        predicted alpha/beta/gamma at the forecast horizon cancel out of the
+        trajectory (they multiply innovations that are zero in expectation),
+        so only the damping phi and the seasonal-slot rotation shape the
+        h-step forecast -- and for ``ets_type="trend"`` no horizon parameter
+        affects it at all. Horizon features therefore do not alter the point
+        forecasts beyond phi; they do affect ``type="parameters"``.
 
         Parameters
         ----------
@@ -1559,146 +1816,36 @@ class HyperTreeETS:
                 last_level = torch.stack([self.fcst_states[series_id]['last_level'] for series_id in test_series_ids])
                 last_trend = torch.stack([self.fcst_states[series_id]['last_trend'] for series_id in test_series_ids])
 
-                # Generate forecasts by rolling the ETS state forward, mirroring
-                # the training forward pass and using each step's forecast as
-                # the pseudo-observation in the state updates.
-                if self.ets_type == "triple":
+                # Roll the ETS state forward via the shared recursion (also
+                # used by the recursive validation metric in eval_fn, so the
+                # two can never diverge).
+                if self.ets_type in ("triple", "additive"):
                     # Extract seasonality in test series order
                     seasonality = torch.stack(
                         [self.fcst_states[series_id]['seasonality'] for series_id in test_series_ids]
                     )
-
                     seasonality_idxs = self._seasonal_positions(
                         test_data[self.seasonality_feature].values
                     ).reshape(self.n_series, self.fcst_h)
-                    batch_idx = torch.arange(self.n_series, dtype=torch.long)
-                    alpha_fcst = fcst_params[:, :, 0]
-                    beta_fcst = fcst_params[:, :, 1]
-                    gamma_fcst = fcst_params[:, :, 2]
-                    phi_fcst = fcst_params[:, :, 3]
+                else:
+                    seasonality = None
+                    seasonality_idxs = None
 
-                    fcsts = []
-                    level_h = last_level
-                    trend_h = last_trend
-                    for h in range(self.fcst_h):
-                        alpha = alpha_fcst[:, h]
-                        beta = beta_fcst[:, h]
-                        gamma = gamma_fcst[:, h]
-                        phi = phi_fcst[:, h]
-                        s_idx = seasonality_idxs[:, h].long()
-                        s_h = seasonality[batch_idx, s_idx]
-
-                        # One-step-ahead fit (pseudo-observation),
-                        # structurally identical to _forward_triple
-                        pseudo_y = (level_h + phi * trend_h) * s_h
-                        fcsts.append(pseudo_y.reshape(-1, 1))
-
-                        # State updates exactly as in _forward_triple.
-                        level_new = (
-                            alpha * (pseudo_y / s_h)
-                            + (1 - alpha) * (level_h + phi * trend_h)
-                        )
-                        trend_new = (
-                            beta * (level_new - level_h)
-                            + (1 - beta) * phi * trend_h
-                        )
-                        seasonality[batch_idx, s_idx] = (
-                            gamma * (pseudo_y / (level_h + phi * trend_h))
-                            + (1 - gamma) * s_h
-                        )
-
-                        level_h = level_new
-                        trend_h = trend_new
-
-                elif self.ets_type == "additive":
-                    # Extract seasonality in test series order
-                    seasonality = torch.stack(
-                        [self.fcst_states[series_id]['seasonality'] for series_id in test_series_ids]
-                    )
-
-                    seasonality_idxs = self._seasonal_positions(
-                        test_data[self.seasonality_feature].values
-                    ).reshape(self.n_series, self.fcst_h)
-                    batch_idx = torch.arange(self.n_series, dtype=torch.long)
-                    alpha_fcst = fcst_params[:, :, 0]
-                    beta_fcst = fcst_params[:, :, 1]
-                    gamma_fcst = fcst_params[:, :, 2]
-                    phi_fcst = fcst_params[:, :, 3]
-
-                    fcsts = []
-                    level_h = last_level
-                    trend_h = last_trend
-                    for h in range(self.fcst_h):
-                        alpha = alpha_fcst[:, h]
-                        beta = beta_fcst[:, h]
-                        gamma = gamma_fcst[:, h]
-                        phi = phi_fcst[:, h]
-                        s_idx = seasonality_idxs[:, h].long()
-                        s_h = seasonality[batch_idx, s_idx]
-
-                        # One-step-ahead fit (pseudo-observation),
-                        # structurally identical to _forward_additive
-                        pred_base = level_h + phi * trend_h
-                        pseudo_y = pred_base + s_h
-                        fcsts.append(pseudo_y.reshape(-1, 1))
-
-                        # State updates exactly as in _forward_additive.
-                        level_new = (
-                            alpha * (pseudo_y - s_h)
-                            + (1 - alpha) * pred_base
-                        )
-                        trend_new = (
-                            beta * (level_new - level_h)
-                            + (1 - beta) * phi * trend_h
-                        )
-                        seasonality[batch_idx, s_idx] = (
-                            gamma * (pseudo_y - pred_base)
-                            + (1 - gamma) * s_h
-                        )
-
-                        level_h = level_new
-                        trend_h = trend_new
-
-                elif self.ets_type == "trend":
-                    alpha_fcst = fcst_params[:, :, 0]
-                    beta_fcst = fcst_params[:, :, 1]
-
-                    fcsts = []
-                    level_h = last_level
-                    trend_h = last_trend
-                    for h in range(self.fcst_h):
-                        alpha = alpha_fcst[:, h]
-                        beta = beta_fcst[:, h]
-
-                        # One-step-ahead fit (pseudo-observation),
-                        # structurally identical to _forward_trend
-                        pseudo_y = level_h + trend_h
-                        fcsts.append(pseudo_y.reshape(-1, 1))
-
-                        # State updates exactly as in _forward_trend
-                        level_new = (
-                            alpha * pseudo_y
-                            + (1 - alpha) * (level_h + trend_h)
-                        )
-                        trend_new = (
-                            beta * (level_new - level_h)
-                            + (1 - beta) * trend_h
-                        )
-
-                        level_h = level_new
-                        trend_h = trend_new
+                fcsts_mat = self._roll_forecast(
+                    last_level, last_trend, seasonality, fcst_params, seasonality_idxs
+                )
 
                 # Create output dataframe
                 model_name = f"Hyper-Tree-ETS({self.ets_type})"
                 out_df = pd.DataFrame({
                     "series_id": test_data["series_id"].to_numpy().flatten(),
                     "date": test_data["date"].to_numpy().flatten(),
-                    "fcst": torch.cat(fcsts, dim=1).flatten().numpy(),
+                    "fcst": fcsts_mat.flatten().numpy(),
                     "model": model_name,
                 })
 
                 if level is not None:
-                    point = torch.cat(fcsts, dim=1).numpy()  # (n_series, fcst_h)
+                    point = fcsts_mat.numpy()  # (n_series, fcst_h)
                     test_series_ids = test_data["series_id"].unique()
                     columns = interval_columns(
                         point=point,

@@ -553,6 +553,11 @@ class HyperTreeNetVAR(_HyperTreeVARBase):
         missing_keys = [key for key in required_net_keys if key not in network_params]
         if missing_keys:
             raise ValueError(f"network_params is missing required keys: {missing_keys}")
+        if network_params.get("use_random_projection") and "rp_embed_dim" not in network_params:
+            raise ValueError(
+                "network_params is missing required keys: ['rp_embed_dim'] "
+                "(required when use_random_projection=True)."
+            )
 
         self.embedding_dim = network_params["embedding_dimension"]
         self._network_params = network_params

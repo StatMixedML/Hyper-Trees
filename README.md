@@ -83,6 +83,8 @@ Hyper-Trees offer several advantages:
 | :--- | :--- | :---: |
 | **`Hyper-Tree-AR`** | Autoregressive model with tree-learned, time-varying AR(p) parameters. | ![](https://img.shields.io/badge/Global-blue) ![](https://img.shields.io/badge/Local-green) |
 | **`Hyper-TreeNet-AR`** | Hybrid model combining tree embeddings with a neural network to learn AR(p) parameters. | ![](https://img.shields.io/badge/Global-blue) ![](https://img.shields.io/badge/Local-green) |
+| **`Hyper-Tree-ARMA`** | Autoregressive moving-average model with tree-learned, time-varying AR(p) and MA(q) parameters, fitted recursion-free via the two-stage Hannan-Rissanen procedure. | ![](https://img.shields.io/badge/Global-blue) ![](https://img.shields.io/badge/Local-green) |
+| **`Hyper-TreeNet-ARMA`** | Hybrid model combining tree embeddings with a neural network to learn the ARMA(p, q) parameters. | ![](https://img.shields.io/badge/Global-blue) ![](https://img.shields.io/badge/Local-green) |
 | **`Hyper-Tree-ETS`** | Exponential smoothing model where ETS parameters are estimated by trees. | ![](https://img.shields.io/badge/Global-blue) ![](https://img.shields.io/badge/Local-green) |
 | **`Hyper-Tree-STL`** | STL decomposition with tree-learned parameters for trend and seasonality. | ![](https://img.shields.io/badge/Local-green) |
 | **`Hyper-Tree-VAR`** | Vector autoregression with tree-learned, time-varying VAR(p) coefficient matrices, capturing cross-series lead/lag dependence. Intended for small aligned panels. | ![](https://img.shields.io/badge/Global-blue) |
