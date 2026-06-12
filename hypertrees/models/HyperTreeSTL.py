@@ -11,7 +11,7 @@ import time
 from ..utils import CustomLogger
 lgb.register_logger(CustomLogger())
 
-from ..utils import TimeSeriesPreprocessor, prepare_datasets, TrainingResult, validate_series_order
+from ..utils import TimeSeriesPreprocessor, prepare_datasets, TrainingResult, validate_series_order, NoDeepcopyObjective
 
 class HyperTreeSTL:
     """
@@ -112,7 +112,10 @@ class HyperTreeSTL:
             Forecast horizon (number of periods to forecast ahead).
         loss_fn : Callable
             Loss function for optimization. Must be a PyTorch loss function.
-            Default is MSE loss, but can be changed for different error metrics.
+            Default is MSE loss. Losses other than nn.MSELoss are not
+            recommended, as they have not been systematically tested yet.
+            nn.L1Loss is rejected (zero second derivative almost everywhere
+            breaks Newton boosting).
         type : str
             Type of model variant to use. Currently, "default" and "paper" are supported:
             - "paper" uses the original method from the paper
@@ -127,6 +130,19 @@ class HyperTreeSTL:
             raise ValueError("Forecast horizon 'fcst_h' must be a positive integer.")
         if not isinstance(loss_fn, nn.Module):
             raise TypeError("loss_fn must be a PyTorch loss function.")
+        if isinstance(loss_fn, nn.L1Loss):
+            raise ValueError(
+                "nn.L1Loss is not supported: its second derivative is zero almost "
+                "everywhere, so LightGBM's Newton boosting receives all-zero Hessians "
+                "and cannot grow trees. Use nn.HuberLoss or nn.SmoothL1Loss for an "
+                "MAE-like loss with usable curvature."
+            )
+        if getattr(loss_fn, "reduction", "mean") == "none":
+            raise ValueError(
+                "loss_fn must use a scalar reduction ('mean' or 'sum'); "
+                "reduction='none' returns per-element losses that the "
+                "boosting objective cannot consume."
+            )
         if not isinstance(freq, str):
             raise TypeError("freq must be a string representing the frequency of the time series.")
         if type not in ["default", "paper"]:
@@ -156,6 +172,7 @@ class HyperTreeSTL:
         self.features = None  # Stores feature names after training
         self.is_trained = False  # Flag to track if model has been trained
         self.dataset_references = {}  # Store references to LightGBM datasets
+        self._seasonal_offset = None  # Training-window seasonal centering (set in train)
 
     def objective_fn(
             self,
@@ -350,7 +367,8 @@ class HyperTreeSTL:
     def _forward_paper(
             self,
             params: torch.Tensor,
-            time_idx: torch.Tensor
+            time_idx: torch.Tensor,
+            seasonal_offset: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass to compute the trend and seasonality from STL parameters.
@@ -362,6 +380,12 @@ class HyperTreeSTL:
             STL decomposition parameters.
         time_idx : torch.Tensor
             Time indices for the observations.
+        seasonal_offset : torch.Tensor, optional
+            Per-series centering constant, shape ``(n_series,)``. When None
+            (training), the seasonal component is re-centered over the given
+            window; when provided (forecasting), this stored training offset
+            is subtracted instead so the decomposition continues the trained
+            one (see ``_compute_seasonal_offset``).
 
         Returns
         -------
@@ -394,19 +418,30 @@ class HyperTreeSTL:
             dim=2
         )
 
-        # Center the seasonal component (remove mean)
-        seasonality = seasonality - torch.mean(seasonality, dim=0, keepdim=True)
+        # Center the seasonal component for identifiability. During training
+        # (seasonal_offset=None) the mean over the given window is removed;
+        # at forecast time the stored training offset is subtracted instead,
+        # so the decomposition continues the trained one rather than
+        # re-centering over the (typically partial-cycle) forecast window.
+        if seasonal_offset is None:
+            seasonality = seasonality - torch.mean(seasonality, dim=0, keepdim=True)
+        else:
+            seasonality = seasonality - seasonal_offset
 
         return trend, seasonality
 
     def _forward_default(
             self,
             params: torch.Tensor,
-            time_idx: torch.Tensor
+            time_idx: torch.Tensor,
+            seasonal_offset: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass to calculate the trend and seasonality from STL parameters.
         This implementation includes an updated trend smoothing method and more efficient seasonality calculation.
+
+        The trend smoothing window (params[:, :, 2]) is learnable: it enters
+        through a differentiable soft-boxcar kernel so gradients reach the GBDT.
 
         Parameters
         ----------
@@ -414,6 +449,12 @@ class HyperTreeSTL:
             STL decomposition parameters.
         time_idx : torch.Tensor
             Time indices for the observations.
+        seasonal_offset : torch.Tensor, optional
+            Per-series centering constant, shape ``(n_series,)``. When None
+            (training), the seasonal component is re-centered per cycle over
+            the given window; when provided (forecasting), this stored
+            training offset is subtracted instead so the decomposition
+            continues the trained one (see ``_compute_seasonal_offset``).
 
         Returns
         -------
@@ -429,21 +470,37 @@ class HyperTreeSTL:
         slope = params[:, :, 1]
         trend_raw = intercept + slope * time_idx
 
-        # Map logit -> odd window size W in [3, max_w]
-        max_w = min(2 * m + 1, 101)
+        # Map logit -> effective window width in [3, max_w_model] per series.
+        # The width enters through a *soft* boxcar kernel so gradients flow back
+        # to the window parameter; a hard int(median(...).item()) cut would
+        # sever the autograd graph, giving zero gradient AND zero Hessian, and
+        # LightGBM would grow zero-valued trees for it (the window would stay
+        # frozen at its sigmoid(0) midpoint forever).
+        max_w_model = min(2 * m + 1, 101)
         w_logit = params[:, :, 2]
-        w_float = (max_w - 3) * torch.sigmoid(w_logit) + 3.0
-        W = int(torch.median(torch.round(w_float)).clamp(3, max_w).item())
-        if W % 2 == 0:
-            W += 1
+        w_eff = (max_w_model - 3.0) * torch.sigmoid(w_logit.mean(dim=0)) + 3.0  # (N,)
 
-        # Grouped conv expects channels divisible by groups.
-        # Put series in the *channel* dimension: input (1, N, T), weight (N, 1, W), groups=N.
-        k = torch.ones((N, 1, W), dtype=dtype) / W  # (N,1,W)
-        xin = trend_raw.T.contiguous().unsqueeze(0)  # (1,N,T)
-        pad = W // 2
-        xpad = torch.nn.functional.pad(xin, (pad, pad), mode="reflect")  # (1,N,T+2p)
-        trend = torch.nn.functional.conv1d(xpad, k, groups=N).squeeze(0).T  # (T,N)
+        # Kernel support: reflect padding requires pad <= T - 1, so cap the
+        # support at 2T - 1 (short forecast horizons used to crash here when
+        # W // 2 exceeded T - 1). Both arguments are odd, so K stays odd.
+        K = min(max_w_model, 2 * T - 1)
+
+        if K >= 3:
+            w_eff = torch.clamp(w_eff, max=float(K))
+            half = K // 2
+            offsets = torch.arange(-half, half + 1, dtype=dtype).abs().view(1, -1)  # (1,K)
+            # Soft boxcar: weight ~ 1 inside +-w_eff/2, smoothly decaying outside.
+            k = torch.sigmoid(w_eff.view(-1, 1) / 2.0 - offsets)  # (N,K)
+            k = (k / k.sum(dim=1, keepdim=True)).unsqueeze(1)  # (N,1,K)
+
+            # Grouped conv expects channels divisible by groups.
+            # Put series in the *channel* dimension: input (1, N, T), weight (N, 1, K), groups=N.
+            xin = trend_raw.T.contiguous().unsqueeze(0)  # (1,N,T)
+            xpad = torch.nn.functional.pad(xin, (half, half), mode="reflect")  # (1,N,T+2*half)
+            trend = torch.nn.functional.conv1d(xpad, k, groups=N).squeeze(0).T  # (T,N)
+        else:
+            # Series too short to smooth (T == 1); keep the raw linear trend.
+            trend = trend_raw
 
         # Seasonality: Fourier with per-cycle zero-mean centering
         H = (self.n_params - 3) // 2
@@ -459,11 +516,22 @@ class HyperTreeSTL:
         angle = time_idx.unsqueeze(-1) * k_h * (2.0 * torch.pi / m)  # (T,N,H)
         seasonality = (wsin * torch.sin(angle) + wcos * torch.cos(angle)).sum(dim=-1)  # (T,N)
 
+        # At forecast time, continue the training decomposition by
+        # subtracting the stored training offset instead of re-centering
+        # over the forecast window (see _compute_seasonal_offset).
+        if seasonal_offset is not None:
+            return trend, seasonality - seasonal_offset
+
         # Per-cycle centering (sum over a cycle ≈ 0)
         C = (T + m - 1) // m
         pad_T = C * m - T
         if pad_T > 0:
-            tail = torch.flip(seasonality[-min(T, pad_T):, :], dims=[0])
+            # Extend by reflection. When the series is shorter than the padding
+            # (T < pad_T, i.e. less than half a seasonal cycle observed), keep
+            # ping-ponging the reflection until a full cycle can be assembled.
+            tail = torch.flip(seasonality, dims=[0])
+            while tail.shape[0] < pad_T:
+                tail = torch.cat([tail, torch.flip(tail, dims=[0])], dim=0)
             S_ext = torch.cat([seasonality, tail[:pad_T]], dim=0)  # (C*m,N)
         else:
             S_ext = seasonality
@@ -473,6 +541,49 @@ class HyperTreeSTL:
         seasonality = S_mcN.transpose(0, 1).reshape(C * m, N)[:T, :]  # (T,N)
 
         return trend, seasonality
+
+    def _compute_seasonal_offset(self, full_ts: pd.DataFrame) -> torch.Tensor:
+        """Seasonal centering offset implied by the training-window fit.
+
+        The forward passes enforce the seasonal identifiability constraint by
+        re-centering over whatever window they are given. Re-centering over a
+        (typically partial-cycle) forecast window would subtract a different
+        constant than the training fit removed, leaking a phase-dependent
+        level offset between trend and seasonality across the train/test
+        boundary. This computes the constant the training fit removed -- the
+        mean raw seasonal value over the training window ("paper" variant)
+        or over the last full cycle ("default" variant, whose training
+        centering is per cycle) -- so ``forecast`` subtracts the same one.
+
+        Parameters
+        ----------
+        full_ts : pd.DataFrame
+            Preprocessed training data (features and ``time`` column).
+
+        Returns
+        -------
+        torch.Tensor
+            Per-series centering offset, shape ``(n_series,)``.
+        """
+        params = torch.tensor(
+            self.model.predict(
+                full_ts[self.features]
+            ).reshape(-1, self.n_series, self.n_params, order="F"),
+            dtype=self.dtype,
+        )
+        time_idx = torch.tensor(
+            full_ts["time"].to_numpy().reshape(-1, self.n_series), dtype=self.dtype
+        )
+        # A zero offset returns the *uncentered* seasonal component.
+        zero = torch.zeros(self.n_series, dtype=self.dtype)
+        _, seasonality_raw = self._forward(params, time_idx, seasonal_offset=zero)
+
+        if self.forward_type == "paper" or seasonality_raw.shape[0] < self.period:
+            window = seasonality_raw
+        else:
+            window = seasonality_raw[-self.period:]
+
+        return window.mean(dim=0)
 
     def train(
             self,
@@ -557,6 +668,7 @@ class HyperTreeSTL:
         self.dataset_references = {}
         self.is_trained = False
         self.features = None
+        self._seasonal_offset = None
 
         if deterministic:
             lgb_params = {**lgb_params, "deterministic": True, "force_row_wise": True}
@@ -576,10 +688,11 @@ class HyperTreeSTL:
             raise NotImplementedError(f"You have provided {self.n_series} series. Currently, HyperTreeSTL only supports univariate training (1 series at a time). Please train separate models for each series.")
         self.train_series_id = train_data['series_id'].unique()[0]
 
-        # General model parameters
+        # General model parameters. The objective wrapper stops lgb.train's
+        # params deepcopy from cloning this instance (see NoDeepcopyObjective).
         self.lgb_params = {
             "num_class": self.n_params,
-            "objective": self.objective_fn,
+            "objective": NoDeepcopyObjective(self.objective_fn),
             "metric": "None",
             "random_seed": seed,
             "verbose": verbose
@@ -654,6 +767,11 @@ class HyperTreeSTL:
             )
             training_time = time.time() - start_time
 
+            # Anchor the seasonal identifiability constraint to the training
+            # window so forecasts continue the trained decomposition (see
+            # _compute_seasonal_offset).
+            self._seasonal_offset = self._compute_seasonal_offset(full_ts)
+
             # Set trained flag to True
             self.is_trained = True
 
@@ -661,7 +779,7 @@ class HyperTreeSTL:
             result = TrainingResult(
                 train_metrics=evals_result["train"] if validation else {"loss": []},
                 validation_metrics=evals_result["validation"] if validation else None,
-                best_iteration=self.model.best_iteration-1 if hasattr(self.model, 'best_iteration') else num_iterations,
+                best_iteration=self.model.best_iteration if self.model.best_iteration > 0 else num_iterations,
                 training_time=training_time
             )
 
@@ -669,7 +787,7 @@ class HyperTreeSTL:
 
         except Exception as e:
             self.is_trained = False
-            raise RuntimeError(f"Training failed: {str(e)}")
+            raise RuntimeError(f"Training failed: {str(e)}") from e
 
     def forecast(
             self,
@@ -762,8 +880,10 @@ class HyperTreeSTL:
 
             time_idx = torch.tensor(test_data["time"].to_numpy().reshape(-1, n_series_test), dtype=self.dtype)
 
-            # Forward pass to calculate trend and seasonal components
-            trend, seasonality = self._forward(params_fcst, time_idx)
+            # Forward pass to calculate trend and seasonal components; the
+            # stored training offset continues the trained decomposition
+            # instead of re-centering over the forecast window.
+            trend, seasonality = self._forward(params_fcst, time_idx, self._seasonal_offset)
 
             # Combine components to get forecasted values
             fcsts_stl = trend + seasonality
@@ -774,7 +894,7 @@ class HyperTreeSTL:
                     "series_id": test_data["series_id"].to_numpy().flatten(),
                     "date": test_data["date"].to_numpy().flatten(),
                     "fcst": fcsts_stl.detach().numpy().flatten(),
-                    "model": f"Hyper-Tree-STL(period={self.period})",
+                    "model": f"Hyper-Tree-STL({self.period})",
                 })
             elif type == "components":
                 out_df = pd.DataFrame({
@@ -782,13 +902,13 @@ class HyperTreeSTL:
                     "date": test_data["date"].to_numpy().flatten(),
                     "trend": trend.detach().numpy().flatten(),
                     "seasonality": seasonality.detach().numpy().flatten(),
-                    "model": f"Hyper-Tree-STL(period={self.period})",
+                    "model": f"Hyper-Tree-STL({self.period})",
                 })
             elif type == "parameters":
                 out_df = pd.DataFrame({
                     "series_id": test_data["series_id"].to_numpy().flatten(),
                     "date": test_data["date"].to_numpy().flatten(),
-                    "model": f"Hyper-Tree-STL(period={self.period})",
+                    "model": f"Hyper-Tree-STL({self.period})",
                 })
                 out_df["trend_intercept"] = params_fcst[:,:, 0].detach().numpy().flatten()
                 out_df["trend_slope"] = params_fcst[:,:, 1].detach().numpy().flatten()
@@ -803,4 +923,4 @@ class HyperTreeSTL:
             return out_df
 
         except Exception as e:
-            raise RuntimeError(f"Forecasting not successful: {str(e)}")
+            raise RuntimeError(f"Forecasting not successful: {str(e)}") from e

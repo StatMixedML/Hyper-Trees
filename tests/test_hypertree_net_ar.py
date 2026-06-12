@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 from hypertrees.models.HyperTreeNetAR import HyperTreeNetAR
 from hypertrees.utils import TrainingResult
+from hypertrees import ForecastIntervals
 
 
 class TestHyperTreeNetARInitialization:
@@ -29,14 +30,14 @@ class TestHyperTreeNetARInitialization:
         
     def test_custom_initialization(self):
         """Test model initialization with custom parameters."""
-        loss_fn = nn.L1Loss()
+        loss_fn = nn.HuberLoss()
         model = HyperTreeNetAR(p=5, freq="D", fcst_h=3, loss_fn=loss_fn, device="cuda")
-        
+
         assert model.p == 5
         assert model.freq == "D"
         assert model.fcst_h == 3
         assert model.loss_fn == loss_fn
-        assert model.loss_name == "L1Loss"
+        assert model.loss_name == "HuberLoss"
         assert model.device == "cuda"
         
     def test_invalid_p_parameter(self):
@@ -84,7 +85,12 @@ class TestHyperTreeNetARInitialization:
     def test_gn_hessian_warning_non_mse(self):
         """Test that warning is issued for non-MSE loss with GN."""
         with pytest.warns(UserWarning, match="not nn.MSELoss"):
-            HyperTreeNetAR(hessian_method="gn", loss_fn=nn.L1Loss())
+            HyperTreeNetAR(hessian_method="gn", loss_fn=nn.HuberLoss())
+
+    def test_l1_loss_rejected(self):
+        """nn.L1Loss is rejected: zero curvature yields all-zero Hessians."""
+        with pytest.raises(ValueError, match="L1Loss is not supported"):
+            HyperTreeNetAR(loss_fn=nn.L1Loss())
 
     def test_invalid_freq_type(self):
         """Test that non-string freq raises TypeError."""
@@ -97,9 +103,51 @@ class TestHyperTreeNetARInitialization:
             HyperTreeNetAR(n_hessian_probes=0)
 
 
+class TestHyperTreeNetARSetForecastOrigin:
+    """Test HyperTreeNetAR.set_forecast_origin."""
+
+    def test_updates_fcst_lags(self):
+        """set_forecast_origin should store last p values per series in reverse order."""
+        model = HyperTreeNetAR(p=3, freq="M", fcst_h=2)
+        history = pd.DataFrame({
+            "series_id": [0]*6 + [1]*6,
+            "date": list(pd.date_range("2020-01-01", periods=6, freq="MS")) * 2,
+            "value": [10, 20, 30, 40, 50, 60] + [100, 200, 300, 400, 500, 600],
+        })
+        model.set_forecast_origin(history)
+        np.testing.assert_array_equal(model.fcst_lags[0], [60, 50, 40])
+        np.testing.assert_array_equal(model.fcst_lags[1], [600, 500, 400])
+
+    def test_reanchor_changes_lags(self):
+        """Calling set_forecast_origin twice should update the lags."""
+        model = HyperTreeNetAR(p=2, freq="M", fcst_h=1)
+        dates = pd.date_range("2020-01-01", periods=5, freq="MS")
+        history1 = pd.DataFrame({
+            "series_id": [0]*5, "date": dates, "value": [1, 2, 3, 4, 5],
+        })
+        history2 = pd.DataFrame({
+            "series_id": [0]*5, "date": dates, "value": [10, 20, 30, 40, 50],
+        })
+        model.set_forecast_origin(history1)
+        np.testing.assert_array_equal(model.fcst_lags[0], [5, 4])
+        model.set_forecast_origin(history2)
+        np.testing.assert_array_equal(model.fcst_lags[0], [50, 40])
+
+    def test_validates_series_order(self):
+        """set_forecast_origin should reject non-contiguous series."""
+        model = HyperTreeNetAR(p=2, freq="M", fcst_h=1)
+        bad = pd.DataFrame({
+            "series_id": [0, 1, 0],
+            "date": pd.date_range("2020-01-01", periods=3, freq="MS"),
+            "value": [1, 2, 3],
+        })
+        with pytest.raises(ValueError, match="non-contiguous"):
+            model.set_forecast_origin(bad)
+
+
 class TestHyperTreeNetARTraining:
     """Test HyperTreeNetAR training functionality."""
-    
+
     @pytest.fixture
     def sample_train_data(self):
         """Create sample training data for testing."""
@@ -351,9 +399,6 @@ class TestHyperTreeNetARForecasting:
 
         mock_network.side_effect = mock_network_call
         model.network = mock_network
-
-        # Mock network state
-        HyperTreeNetAR._network_states = {}
 
         # Mock the stored forecast lags (last 2 values for each series in reverse order)
         model.fcst_lags = {
@@ -685,36 +730,36 @@ class TestHyperTreeNetARInternalMethods:
         assert np.isfinite(grad).all()
         assert np.isfinite(hess).all()
 
-    def test_eval_function_with_network_state(self, model):
-        """Test evaluation function with proper network state handling."""
+    def test_eval_function_uses_live_network(self, model):
+        """eval_fn must use the live self.network directly (no state reload)."""
         model.embedding_dim = 2
         model.device = "cpu"
         model.dataset_references = {}
         model.lags_train = torch.randn(3, 2)
-        
+
         # Mock network
         mock_network = Mock()
         mock_network.eval.return_value = None
-        mock_network.load_state_dict.return_value = None
         def mock_network_call(x):
             return torch.randn(3, 2)
         mock_network.side_effect = mock_network_call
         model.network = mock_network
-        
-        # Store network state
-        HyperTreeNetAR._network_states = {}
-        
+
         # Setup test data
         predt = np.random.randn(6)  # 3 samples * 2 embeddings
         mock_data = Mock()
         mock_data.get_label.return_value = np.array([1.0, 2.0, 3.0])
-        
+
         metric_name, metric_value, is_higher_better = model.eval_fn(predt, mock_data)
 
         # Check outputs
         assert metric_name == model.loss_name
         assert isinstance(metric_value, float)
         assert is_higher_better is False
+        # Regression guard: the network updated by the objective in the same
+        # boosting iteration is used as-is. Reloading from a stored state_dict
+        # is what previously allowed cross-instance weight leaks.
+        mock_network.load_state_dict.assert_not_called()
 
 
 class TestHyperTreeNetAREdgeCases:
@@ -760,21 +805,81 @@ class TestHyperTreeNetAREdgeCases:
             
     def test_different_loss_functions(self):
         """Test with different PyTorch loss functions."""
-        loss_functions = [nn.MSELoss(), nn.L1Loss(), nn.HuberLoss()]
+        loss_functions = [nn.MSELoss(), nn.SmoothL1Loss(), nn.HuberLoss()]
         
         for loss_fn in loss_functions:
             model = HyperTreeNetAR(loss_fn=loss_fn)
             assert model.loss_fn == loss_fn
             assert model.loss_name == loss_fn.__class__.__name__
     
-    def test_network_state_management(self):
-        """Test network state storage and retrieval."""
-        model1 = HyperTreeNetAR(p=2)
-        model2 = HyperTreeNetAR(p=3)
+    def test_no_shared_network_state(self):
+        """Regression guard: no class-level network state shared across instances.
 
-        # Test state storage
-        test_state = {'test': 'state'}
-        HyperTreeNetAR._network_states = test_state
+        A class-level ``_network_states`` allowed any later-trained instance
+        (e.g. the fresh models created during conformal calibration) to
+        overwrite the weights another instance loaded at forecast time.
+        """
+        assert not hasattr(HyperTreeNetAR, "_network_states")
+
+    def test_boosting_trains_this_instances_network(self):
+        """The boosting objective must train THIS instance's MLP decoder.
+
+        ``lgb.train`` deep-copies its params dict before extracting the
+        objective; an unprotected bound-method objective gets re-bound to a
+        hidden deep copy of the model, leaving ``self.network`` at its random
+        initialization (``NoDeepcopyObjective`` guards against this). An
+        untrained network is detectable because the MLP init is
+        seed-deterministic: a fresh MLP built with the same seed has
+        identical weights.
+        """
+        from hypertrees.models.mlp import MLP
+
+        n = 30
+        dates = pd.date_range("2020-01-01", periods=n, freq="D")
+        rng = np.random.default_rng(0)
+        train_data = pd.DataFrame({
+            "series_id": "S1",
+            "date": dates,
+            "value": 100 + np.sin(np.arange(n) / 3) * 10 + rng.normal(0, 1, n),
+            "dow": dates.dayofweek.astype(float),
+        })
+
+        seed = 123
+        network_params = {
+            "learning_rate": 1e-2,
+            "embedding_dimension": 1,
+            "hidden_dim": 8,
+            "dropout": 0.1,
+            "use_random_projection": True,
+            "rp_embed_dim": 2,
+        }
+        model = HyperTreeNetAR(p=2, freq="D", fcst_h=2)
+        model.train(
+            lgb_params={"learning_rate": 0.1, "min_data_in_leaf": 2},
+            network_params=network_params,
+            num_iterations=5,
+            train_data=train_data,
+            seed=seed,
+        )
+
+        fresh = MLP(
+            tree_embed_dim=1,
+            output_dim=model.p,
+            hidden_dim=network_params["hidden_dim"],
+            use_random_projection=True,
+            rp_embed_dim=network_params["rp_embed_dim"],
+            dropout_rate=network_params["dropout"],
+            seed=seed,
+        )
+        fresh_params = dict(fresh.named_parameters())
+        changed = any(
+            not torch.allclose(param.detach().cpu(), fresh_params[name].detach())
+            for name, param in model.network.named_parameters()
+        )
+        assert changed, (
+            "self.network still has its seed-initial weights after training -- "
+            "the objective trained a deep copy of the model instead of this instance."
+        )
 
 
 class TestHyperTreeNetARIntegration:
@@ -881,9 +986,6 @@ class TestHyperTreeNetARIntegration:
             return torch.randn(x.shape[0], 2)  # Return appropriate size
         mock_network.side_effect = mock_network_call
         model.network = mock_network
-        
-        # Store network state
-        HyperTreeNetAR._network_states = {}
 
         # Mock the fcst_lags that would be created during real training
         # Get the last p values for each series (in reverse order: newest to oldest)
@@ -1273,3 +1375,82 @@ class TestHyperTreeNetARObjectiveFunction:
         # Hessians should generally be non-negative (for MSE loss)
         # Allow for some numerical precision issues in this integration test
         assert np.isfinite(hess).all()  # Just ensure they're finite
+
+
+class TestHyperTreeNetARConformal:
+    """Tests for conformal prediction intervals on HyperTreeNetAR."""
+
+    FCST_H = 4
+    N_SERIES = 2
+    N_OBS = 60
+    LGB_PARAMS = {"learning_rate": 0.1, "num_leaves": 15, "min_data_in_leaf": 1, "min_data_in_bin": 1}
+    NETWORK_PARAMS = {
+        "learning_rate": 1e-3, "embedding_dimension": 1, "hidden_dim": 32,
+        "dropout": 0.0, "use_random_projection": False, "rp_embed_dim": None,
+    }
+
+    def _make_data(self):
+        rng = np.random.default_rng(42)
+        dates = pd.date_range("2015-01-01", periods=self.N_OBS, freq="MS")
+        frames = []
+        for sid in range(self.N_SERIES):
+            frames.append(pd.DataFrame({
+                "series_id": sid, "date": dates,
+                "value": rng.standard_normal(self.N_OBS).cumsum() + 100,
+                "month": dates.month, "quarter": dates.quarter,
+            }))
+        return pd.concat(frames, ignore_index=True)
+
+    def _split(self, df):
+        test = df.groupby("series_id", sort=False).tail(self.FCST_H).reset_index(drop=True)
+        train = df.drop(df.groupby("series_id", sort=False).tail(self.FCST_H).index).reset_index(drop=True)
+        return train, test
+
+    @pytest.fixture
+    def split(self):
+        return self._split(self._make_data())
+
+    @pytest.fixture
+    def calibrated(self, split):
+        train, test = split
+        model = HyperTreeNetAR(p=2, freq="M", fcst_h=self.FCST_H)
+        model.train(lgb_params=self.LGB_PARAMS, network_params=self.NETWORK_PARAMS,
+                     num_iterations=20, train_data=train,
+                     forecast_intervals=ForecastIntervals(n_windows=3, refit=False))
+        return model, train, test
+
+    def test_calibration_sets_state(self, calibrated):
+        model, _, _ = calibrated
+        assert model._is_calibrated is True
+        assert model._cs_scores.shape == (3, self.N_SERIES, self.FCST_H)
+        assert np.all(model._cs_scores >= 0)
+
+    def test_no_calibration_by_default(self, split):
+        train, _ = split
+        model = HyperTreeNetAR(p=2, freq="M", fcst_h=self.FCST_H)
+        model.train(lgb_params=self.LGB_PARAMS, network_params=self.NETWORK_PARAMS,
+                     num_iterations=20, train_data=train)
+        assert model._is_calibrated is False
+
+    def test_forecast_adds_interval_columns(self, calibrated):
+        model, _, test = calibrated
+        mn = "Hyper-TreeNet-AR(2)"
+        out = model.forecast(test_data=test, level=[80, 90])
+        for lv in [80, 90]:
+            assert f"{mn}-lo-{lv}" in out.columns
+            assert f"{mn}-hi-{lv}" in out.columns
+
+    def test_interval_nesting(self, calibrated):
+        model, _, test = calibrated
+        mn = "Hyper-TreeNet-AR(2)"
+        out = model.forecast(test_data=test, level=[80, 90])
+        assert np.all(out[f"{mn}-lo-90"].to_numpy() <= out[f"{mn}-lo-80"].to_numpy() + 1e-9)
+        assert np.all(out[f"{mn}-hi-80"].to_numpy() <= out[f"{mn}-hi-90"].to_numpy() + 1e-9)
+
+    def test_level_without_calibration_raises(self, split):
+        train, test = split
+        model = HyperTreeNetAR(p=2, freq="M", fcst_h=self.FCST_H)
+        model.train(lgb_params=self.LGB_PARAMS, network_params=self.NETWORK_PARAMS,
+                     num_iterations=20, train_data=train)
+        with pytest.raises(RuntimeError, match="not calibrated"):
+            model.forecast(test_data=test, level=[90])

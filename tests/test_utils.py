@@ -385,6 +385,20 @@ class TestValidateSeriesOrder:
         with pytest.raises(ValueError, match="not strictly increasing"):
             validate_series_order(data)
 
+    def test_duplicate_dates(self):
+        """Duplicate dates within a series must be rejected (strictness).
+
+        ``is_monotonic_increasing`` alone is non-strict and would let
+        duplicates through, corrupting lag construction and reshapes.
+        """
+        data = pd.DataFrame({
+            'series_id': [0, 0, 0],
+            'date': pd.to_datetime(['2020-01-01', '2020-01-01', '2020-01-02']),
+            'value': [1, 2, 3]
+        })
+        with pytest.raises(ValueError, match="not strictly increasing"):
+            validate_series_order(data)
+
     def test_valid_data_passes(self):
         """Test that properly ordered data passes validation."""
         data = pd.DataFrame({

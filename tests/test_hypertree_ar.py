@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 from hypertrees.models.HyperTreeAR import HyperTreeAR
 from hypertrees.utils import TrainingResult
+from hypertrees import ForecastIntervals
 
 
 class TestHyperTreeARInitialization:
@@ -28,14 +29,14 @@ class TestHyperTreeARInitialization:
         
     def test_custom_initialization(self):
         """Test model initialization with custom parameters."""
-        loss_fn = nn.L1Loss()
+        loss_fn = nn.HuberLoss()
         model = HyperTreeAR(p=5, freq="D", fcst_h=3, loss_fn=loss_fn)
         
         assert model.p == 5
         assert model.freq == "D"
         assert model.fcst_h == 3
         assert model.loss_fn == loss_fn
-        assert model.loss_name == "L1Loss"
+        assert model.loss_name == "HuberLoss"
         
     def test_invalid_p_parameter(self):
         """Test that invalid p parameter raises ValueError."""
@@ -69,20 +70,34 @@ class TestHyperTreeARInitialization:
         assert hasattr(model, '_gn_hessian')
 
     def test_default_hessian_method(self):
-        """Test that default hessian method is exact."""
+        """Test that the default hessian method is the analytic fast path."""
         model = HyperTreeAR()
-        assert model.hessian_method == "exact"
+        assert model.hessian_method == "analytic"
         assert not hasattr(model, '_gn_hessian')
 
     def test_invalid_hessian_method(self):
         """Test that invalid hessian_method raises ValueError."""
-        with pytest.raises(ValueError, match="hessian_method must be either 'exact' or 'gn'"):
+        with pytest.raises(ValueError, match="hessian_method must be one of 'exact', 'analytic', or 'gn'"):
             HyperTreeAR(hessian_method="invalid")
+
+    def test_analytic_hessian_initialization(self):
+        """Test model initialization with the analytic hessian method."""
+        model = HyperTreeAR(hessian_method="analytic")
+        assert model.hessian_method == "analytic"
+        assert not hasattr(model, '_gn_hessian')
+        assert model.calculate_gradients_and_hessians == model._calculate_gradients_and_hessians_analytic
 
     def test_gn_hessian_warning_non_mse(self):
         """Test that warning is issued for non-MSE loss with GN."""
         with pytest.warns(UserWarning, match="not nn.MSELoss"):
-            HyperTreeAR(hessian_method="gn", loss_fn=nn.L1Loss())
+            HyperTreeAR(hessian_method="gn", loss_fn=nn.HuberLoss())
+
+    def test_l1_loss_rejected(self):
+        """nn.L1Loss must be rejected: its second derivative is zero almost
+        everywhere, so Newton boosting would receive all-zero Hessians and
+        could not grow trees."""
+        with pytest.raises(ValueError, match="L1Loss is not supported"):
+            HyperTreeAR(loss_fn=nn.L1Loss())
 
     def test_invalid_freq_type(self):
         """Test that non-string freq raises TypeError."""
@@ -98,9 +113,52 @@ class TestHyperTreeARInitialization:
             HyperTreeAR(n_hessian_probes=-5)
 
 
+class TestHyperTreeARSetForecastOrigin:
+    """Test HyperTreeAR.set_forecast_origin."""
+
+    def test_updates_fcst_lags(self):
+        """set_forecast_origin should store last p values per series in reverse order."""
+        model = HyperTreeAR(p=3, freq="M", fcst_h=2)
+        history = pd.DataFrame({
+            "series_id": [0]*6 + [1]*6,
+            "date": list(pd.date_range("2020-01-01", periods=6, freq="MS")) * 2,
+            "value": [10, 20, 30, 40, 50, 60] + [100, 200, 300, 400, 500, 600],
+        })
+        model.set_forecast_origin(history)
+        # last 3 values of series 0: [60, 50, 40], reversed = newest-first
+        np.testing.assert_array_equal(model.fcst_lags[0], [60, 50, 40])
+        np.testing.assert_array_equal(model.fcst_lags[1], [600, 500, 400])
+
+    def test_reanchor_changes_lags(self):
+        """Calling set_forecast_origin twice should update the lags."""
+        model = HyperTreeAR(p=2, freq="M", fcst_h=1)
+        dates = pd.date_range("2020-01-01", periods=5, freq="MS")
+        history1 = pd.DataFrame({
+            "series_id": [0]*5, "date": dates, "value": [1, 2, 3, 4, 5],
+        })
+        history2 = pd.DataFrame({
+            "series_id": [0]*5, "date": dates, "value": [10, 20, 30, 40, 50],
+        })
+        model.set_forecast_origin(history1)
+        np.testing.assert_array_equal(model.fcst_lags[0], [5, 4])
+        model.set_forecast_origin(history2)
+        np.testing.assert_array_equal(model.fcst_lags[0], [50, 40])
+
+    def test_validates_series_order(self):
+        """set_forecast_origin should reject non-contiguous series."""
+        model = HyperTreeAR(p=2, freq="M", fcst_h=1)
+        bad = pd.DataFrame({
+            "series_id": [0, 1, 0],
+            "date": pd.date_range("2020-01-01", periods=3, freq="MS"),
+            "value": [1, 2, 3],
+        })
+        with pytest.raises(ValueError, match="non-contiguous"):
+            model.set_forecast_origin(bad)
+
+
 class TestHyperTreeARTraining:
     """Test HyperTreeAR training functionality."""
-    
+
     @pytest.fixture
     def sample_train_data(self):
         """Create sample training data for testing."""
@@ -251,7 +309,7 @@ class TestHyperTreeARTraining:
         assert isinstance(result, TrainingResult)
         assert result.train_metrics == {'loss': []}
         assert result.validation_metrics is None
-        assert result.best_iteration == 9  # best_iteration-1 in implementation
+        assert result.best_iteration == 10  # model.best_iteration when > 0
         assert result.training_time is not None
         
     @patch('hypertrees.models.HyperTreeAR.lgb.train')
@@ -454,8 +512,15 @@ class TestHyperTreeARInternalMethods:
         # Check that parameters require gradients
         assert params.requires_grad
             
-    def test_calculate_gradients_and_hessians(self, model):
-        """Test gradient and hessian calculation."""
+    def test_calculate_gradients_and_hessians(self):
+        """Test gradient and hessian calculation (exact autograd path).
+
+        Uses an explicit hessian_method="exact" model: only the exact path can
+        differentiate a hand-built loss; "analytic" (the default) relies on
+        the fit/target/lags stored by get_params_loss.
+        """
+        model = HyperTreeAR(p=2, hessian_method="exact")
+
         # Create parameters that require gradients
         params = torch.randn(5, 2, requires_grad=True)
 
@@ -1104,7 +1169,7 @@ class TestHyperTreeAREvalFunction:
         """Test eval_fn with different loss functions."""
         loss_functions = [
             (nn.MSELoss(), "MSELoss"),
-            (nn.L1Loss(), "L1Loss"),
+            (nn.HuberLoss(), "HuberLoss"),
             (nn.SmoothL1Loss(), "SmoothL1Loss")
         ]
 
@@ -1145,3 +1210,196 @@ class TestHyperTreeAREvalFunction:
         assert isinstance(metric_name, str)
         assert isinstance(metric_value, float)
         assert is_higher_better is False
+
+
+class TestHyperTreeARConformal:
+    """Tests for conformal prediction intervals on HyperTreeAR."""
+
+    P = 2
+    FCST_H = 4
+    N_SERIES = 3
+    N_OBS = 60
+    MODEL_NAME = f"Hyper-Tree-AR({P})"
+    LGB_PARAMS = {"learning_rate": 0.1, "num_leaves": 15, "min_data_in_leaf": 1, "min_data_in_bin": 1}
+
+    def _make_data(self):
+        rng = np.random.default_rng(42)
+        dates = pd.date_range("2015-01-01", periods=self.N_OBS, freq="MS")
+        frames = []
+        for sid in range(self.N_SERIES):
+            frames.append(pd.DataFrame({
+                "series_id": sid, "date": dates,
+                "value": rng.standard_normal(self.N_OBS).cumsum() + 100,
+                "month": dates.month, "quarter": dates.quarter,
+            }))
+        return pd.concat(frames, ignore_index=True)
+
+    def _split(self, df):
+        test = df.groupby("series_id", sort=False).tail(self.FCST_H).reset_index(drop=True)
+        train = df.drop(df.groupby("series_id", sort=False).tail(self.FCST_H).index).reset_index(drop=True)
+        return train, test
+
+    @pytest.fixture
+    def split(self):
+        return self._split(self._make_data())
+
+    @pytest.fixture
+    def calibrated(self, split):
+        train, test = split
+        model = HyperTreeAR(p=self.P, freq="M", fcst_h=self.FCST_H)
+        model.train(lgb_params=self.LGB_PARAMS, num_iterations=20, train_data=train,
+                     forecast_intervals=ForecastIntervals(n_windows=3))
+        return model, train, test
+
+    def test_calibration_sets_state(self, calibrated):
+        model, _, _ = calibrated
+        assert model._is_calibrated is True
+        assert model._cs_scores.shape == (3, self.N_SERIES, self.FCST_H)
+        assert np.all(model._cs_scores >= 0)
+        assert model._cs_series_order == [0, 1, 2]
+
+    def test_no_calibration_by_default(self, split):
+        train, _ = split
+        model = HyperTreeAR(p=self.P, freq="M", fcst_h=self.FCST_H)
+        model.train(lgb_params=self.LGB_PARAMS, num_iterations=20, train_data=train)
+        assert model._is_calibrated is False
+        assert model._cs_scores is None
+
+    def test_forecast_adds_interval_columns(self, calibrated):
+        model, _, test = calibrated
+        out = model.forecast(test_data=test, level=[80, 90])
+        for lv in [80, 90]:
+            assert f"{self.MODEL_NAME}-lo-{lv}" in out.columns
+            assert f"{self.MODEL_NAME}-hi-{lv}" in out.columns
+        assert np.isfinite(out[f"{self.MODEL_NAME}-lo-90"]).all()
+
+    def test_interval_nesting(self, calibrated):
+        model, _, test = calibrated
+        mn = self.MODEL_NAME
+        out = model.forecast(test_data=test, level=[80, 90])
+        assert np.all(out[f"{mn}-lo-90"].to_numpy() <= out[f"{mn}-lo-80"].to_numpy() + 1e-9)
+        assert np.all(out[f"{mn}-lo-80"].to_numpy() <= out["fcst"].to_numpy() + 1e-9)
+        assert np.all(out["fcst"].to_numpy() <= out[f"{mn}-hi-80"].to_numpy() + 1e-9)
+        assert np.all(out[f"{mn}-hi-80"].to_numpy() <= out[f"{mn}-hi-90"].to_numpy() + 1e-9)
+
+    def test_point_forecast_unchanged_by_level(self, calibrated):
+        model, _, test = calibrated
+        base = model.forecast(test_data=test)
+        with_intervals = model.forecast(test_data=test, level=[90])
+        np.testing.assert_allclose(base["fcst"].to_numpy(), with_intervals["fcst"].to_numpy())
+
+    def test_both_methods_run(self, split):
+        train, test = split
+        for method in ("conformal_distribution", "conformal_error"):
+            model = HyperTreeAR(p=self.P, freq="M", fcst_h=self.FCST_H)
+            model.train(lgb_params=self.LGB_PARAMS, num_iterations=20, train_data=train,
+                         forecast_intervals=ForecastIntervals(n_windows=3, method=method))
+            out = model.forecast(test_data=test, level=[90])
+            assert f"{self.MODEL_NAME}-lo-90" in out.columns
+            assert np.all(out[f"{self.MODEL_NAME}-lo-90"].to_numpy() <= out[f"{self.MODEL_NAME}-hi-90"].to_numpy())
+
+    def test_refit_false_produces_intervals(self, split):
+        train, test = split
+        model = HyperTreeAR(p=self.P, freq="M", fcst_h=self.FCST_H)
+        model.train(lgb_params=self.LGB_PARAMS, num_iterations=20, train_data=train,
+                     forecast_intervals=ForecastIntervals(n_windows=3, refit=False))
+        assert model._is_calibrated is True
+        out = model.forecast(test_data=test, level=[80, 90])
+        assert np.all(out[f"{self.MODEL_NAME}-lo-90"].to_numpy() <= out[f"{self.MODEL_NAME}-hi-90"].to_numpy())
+
+    def test_level_without_calibration_raises(self, split):
+        train, test = split
+        model = HyperTreeAR(p=self.P, freq="M", fcst_h=self.FCST_H)
+        model.train(lgb_params=self.LGB_PARAMS, num_iterations=20, train_data=train)
+        with pytest.raises(RuntimeError, match="not calibrated"):
+            model.forecast(test_data=test, level=[90])
+
+    def test_short_series_raises(self):
+        short = self._make_data()
+        short = short.groupby("series_id", sort=False).head(10).reset_index(drop=True)
+        train, _ = self._split(short)
+        model = HyperTreeAR(p=self.P, freq="M", fcst_h=self.FCST_H)
+        with pytest.raises(ValueError, match="too short"):
+            model.train(lgb_params=self.LGB_PARAMS, num_iterations=20, train_data=train,
+                         forecast_intervals=ForecastIntervals(n_windows=5))
+
+    def test_invalid_level_value(self, calibrated):
+        model, _, test = calibrated
+        with pytest.raises(ValueError):
+            model.forecast(test_data=test, level=[150])
+
+
+class TestHyperTreeARAnalyticHessian:
+    """Tests for hessian_method='analytic' (closed-form via model linearity)."""
+
+    @staticmethod
+    def _grad_hess(method, loss_fn, predt, target, lags, p):
+        """Run one objective-style grad/hess computation with the given method."""
+        model = HyperTreeAR(p=p, loss_fn=loss_fn, hessian_method=method)
+        params, loss = model.get_params_loss(predt, target, lags, requires_grad=True)
+        return model.calculate_gradients_and_hessians(loss, params)
+
+    def test_analytic_matches_exact_across_losses(self):
+        """Analytic grad/hess must equal the autograd 'exact' path.
+
+        Covers the MSE fast path (no autograd) and the generic
+        double-backward path (Huber, SmoothL1).
+        """
+        torch.manual_seed(0)
+        n, p = 40, 3
+        rng = np.random.default_rng(0)
+        predt = rng.standard_normal(n * p)
+        lags = torch.randn(n, p)
+        target = torch.randn(n, 1) * 5
+
+        for loss_fn in [nn.MSELoss(), nn.HuberLoss(), nn.SmoothL1Loss()]:
+            g_exact, h_exact = self._grad_hess("exact", loss_fn, predt.copy(), target, lags, p)
+            g_analytic, h_analytic = self._grad_hess("analytic", loss_fn, predt.copy(), target, lags, p)
+            np.testing.assert_allclose(
+                g_analytic, g_exact, rtol=1e-5, atol=1e-7,
+                err_msg=f"gradient mismatch for {type(loss_fn).__name__}",
+            )
+            np.testing.assert_allclose(
+                h_analytic, h_exact, rtol=1e-5, atol=1e-7,
+                err_msg=f"hessian mismatch for {type(loss_fn).__name__}",
+            )
+
+    def test_analytic_matches_exact_sum_reduction(self):
+        """The MSE fast path must honor reduction='sum' as well."""
+        n, p = 25, 2
+        rng = np.random.default_rng(1)
+        predt = rng.standard_normal(n * p)
+        lags = torch.randn(n, p)
+        target = torch.randn(n, 1)
+
+        loss_fn = nn.MSELoss(reduction="sum")
+        g_exact, h_exact = self._grad_hess("exact", loss_fn, predt.copy(), target, lags, p)
+        g_analytic, h_analytic = self._grad_hess("analytic", loss_fn, predt.copy(), target, lags, p)
+        np.testing.assert_allclose(g_analytic, g_exact, rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(h_analytic, h_exact, rtol=1e-5, atol=1e-6)
+
+    def test_train_and_forecast_with_analytic(self):
+        """End-to-end training with hessian_method='analytic' works."""
+        n = 30
+        dates = pd.date_range("2020-01-01", periods=n, freq="D")
+        train = pd.DataFrame({
+            "series_id": "S1",
+            "date": dates,
+            "value": 100 + 10 * np.sin(np.arange(n) / 3),
+            "dow": dates.dayofweek.astype(float),
+        })
+        test = pd.DataFrame({
+            "series_id": "S1",
+            "date": pd.date_range(dates[-1] + pd.Timedelta(days=1), periods=2, freq="D"),
+            "dow": [0.0, 1.0],
+        })
+
+        model = HyperTreeAR(p=2, freq="D", fcst_h=2, hessian_method="analytic")
+        model.train(
+            lgb_params={"learning_rate": 0.1, "min_data_in_leaf": 2},
+            num_iterations=5,
+            train_data=train,
+        )
+        out = model.forecast(test_data=test)
+        assert len(out) == 2
+        assert np.isfinite(out["fcst"]).all()

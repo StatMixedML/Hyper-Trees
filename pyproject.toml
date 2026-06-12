@@ -1,6 +1,6 @@
 [project]
 name = "hypertrees-forecasting"
-version = "0.1.1"
+version = "0.2.0"
 description = "Forecasting with Hyper-Trees"
 readme = {file = "README.md", content-type = "text/markdown"}
 authors = [
@@ -89,15 +89,11 @@ build-backend = "setuptools.build_meta"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# restrict to models and utils
-addopts = "--cov=hypertrees.models --cov=hypertrees.utils --cov-report=term-missing"
+addopts = "--import-mode=importlib"
 
 [tool.coverage.run]
 branch = true
-source = [
-    "hypertrees/models",
-    "hypertrees/utils.py",
-]
+source_pkgs = ["hypertrees"]
 
 [tool.coverage.report]
 show_missing = true

@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pandas as pd
 import torch
@@ -6,65 +8,118 @@ from torch.autograd import grad as autograd
 import lightgbm as lgb
 from typing import Tuple, Callable, Optional, List
 import time
-from ..utils import TimeSeriesPreprocessor, prepare_datasets, TrainingResult, CustomLogger, validate_series_order, extract_forecast_lags, GaussNewtonHessian, NoDeepcopyObjective
+from ..utils import CustomLogger
+lgb.register_logger(CustomLogger())
+
+from ..utils import TimeSeriesPreprocessor, prepare_datasets, TrainingResult, validate_series_order, extract_forecast_lags, GaussNewtonHessian, NoDeepcopyObjective
 from ..conformal import (
     ForecastIntervals,
     validate_calibration_length,
     rolling_origin_residuals,
     interval_columns,
 )
+from .HyperTreeAR import HyperTreeAR
 from .mlp import MLP
-import warnings
-lgb.register_logger(CustomLogger())
 
 warnings.filterwarnings(
     "ignore",
     message="Using backward\\(\\) with create_graph=True will create a reference cycle.*"
 )
 
-class HyperTreeNetAR:
-    """
-    Class that implements a Hyper-TreeNet-AR(p) model for time series forecasting.
 
-    It combines LightGBM with a neural network, where the LightGBM first creates embeddings from the input data which
-    are then mapped as parameters to the target time series model. The Hyper-TreeNet-AR(p) model extends traditional
-    autoregressive models by allowing the AR coefficients to be time-varying and estimated by a
-    combination of neural network and gradient boosted trees. This creates a non-linear, adaptive autoregressive model
-    that can capture complex temporal dependencies.
+class HyperTreeNetARMA:
+    """
+    Class that implements a Hyper-TreeNet-ARMA(p, q) model for time series forecasting.
+
+    It combines LightGBM with a neural network, where the LightGBM first
+    creates embeddings from the input data which are then mapped as parameters
+    to the target ARMA model
+
+        y_t = sum_{j=1..p} phi_j(x_t) * y_{t-j} + sum_{i=1..q} theta_i(x_t) * eps_{t-i} + eps_t
+
+    so that the AR coefficients phi_j and the MA coefficients theta_i are
+    time-varying. The MA block is an error-correction mechanism: it regresses
+    on the model's own past one-step forecast errors, adjusting the forecast
+    when recent periods were over- or under-predicted.
+
+    As in ``HyperTreeARMA``, the latent innovations are obtained recursion-free
+    via the two-stage Hannan-Rissanen approach:
+
+    1. **Stage 1**: a long autoregression (a direct ``HyperTreeAR`` of order
+       ``stage1_p``, by default the Gomez-Maravall proposal
+       ``max(floor(log(T)**2), 2 * max(p, q))`` used by statsmodels'
+       ``hannan_rissanen`` and RATS' ``@HannanRissanen``) is fitted to the
+       training data and its in-sample one-step residuals
+       ``eps_hat_t = y_t - y_hat_t`` are extracted. The residual extractor
+       stays a direct (one tree per lag) AR by design: it is fitted once,
+       analytic Hessians keep it cheap, and ``HyperTreeARMA`` /
+       ``HyperTreeNetARMA`` then share identical residual proxies.
+    2. **Stage 2**: the lagged residuals are treated as *observed* regressors
+       in the widened design ``[y_{t-1..t-p}, eps_hat_{t-1..t-q}]``, and the
+       GBDT encoder + MLP decoder maps features to the ``p + q`` coefficients
+       applied to it.
+
+    Training uses separated gradient flows (Option 2 in the paper, which the
+    ablations found indistinguishable from the shared-flow Option 1): per
+    boosting iteration the MLP takes one optimizer step on the current GBDT
+    embeddings, then gradients and Hessians for the GBDT are computed through
+    the updated network in inference mode. As in HyperTreeNetAR, the MLP
+    decoder lives on the instance (``self.network``) and is updated in place
+    during boosting; there is deliberately no shared/class-level network state.
+    Unlike ``HyperTreeNetAR``, this model exposes no ``gradient_mode`` option;
+    only the separated flow (Option 2) is implemented.
+
+    Beyond the forecast origin, future innovations are unobserved with
+    expectation zero, so the MA terms contribute to the first ``q`` horizon
+    steps (multiplying the known last residuals) and then vanish, leaving the
+    pure AR recursion.
 
     Key features:
-    - Combines LightGBM and a neural network for time series forecasting
-    - Allows AR coefficients to vary based on features
-    - Provides AR coefficients that can vary over time
+    - Combines LightGBM and a neural network for ARMA time series modeling
+    - Allows AR and MA coefficients to vary based on features
+    - Recursion-free estimation via Hannan-Rissanen residual proxies
+    - Boosting cost of the stage-2 model is independent of ``p + q``
 
     Use this model when:
-    - You have relevant features that might influence the autoregressive structure
-    - You want more flexibility than traditional AR models
-    - You have a large number of AR(p) parameters to estimate, since GBDTs do not scale well with the number of parameters
-    - You want to leverage the power of LightGBM for feature selection and representation learning
-    - You want to use a neural network to learn the mapping from features to AR coefficients
+    - The series has short-memory error-correction structure that a pure
+      AR(p) of moderate order does not capture
+    - The lag structure implies many coefficients, since GBDTs do not scale
+      well with the number of parameters
+    - You want to leverage LightGBM for feature encoding and a neural network
+      for the mapping from embeddings to ARMA coefficients
+
+    References
+    ----------
+    [1] Hannan, E. J., & Rissanen, J. (1982). Recursive Estimation of Mixed
+        Autoregressive-Moving Average Order. Biometrika, 69(1), 81-94.
+    [2] Gomez, V., & Maravall, A. (2001). Automatic Modeling Methods for
+        Univariate Series. In Pena, Tiao & Tsay (eds.), A Course in Time
+        Series Analysis. Wiley. (Default order of the stage-1 long AR.)
 
     Example usage:
     ```python
-    from hypertrees.models import HyperTreeNetAR
+    # Imports
+    from hypertrees.models import HyperTreeNetARMA
     import torch
     import pandas as pd
     import matplotlib.pyplot as plt
 
     # Initialize model
-    lag_p = 12
+    lag_p = 2
+    lag_q = 1
     frequency = 'M'
     fcst_h = 12
-    model = HyperTreeNetAR(
+    model = HyperTreeNetARMA(
         p=lag_p,
+        q=lag_q,
         freq=frequency,
         fcst_h=fcst_h,
-        device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device="cuda" if torch.cuda.is_available() else "cpu"
     )
 
     # Data
     # The data needs to have the following columns: 'date', 'series_id', 'value'. All other columns are automatically treated as features.
-    # You don't have to add lag-values yourself, this happens automatically during training.
+    # You don't have to add lag-values or residuals yourself, this happens automatically during training.
     df = pd.read_csv('https://datasets-nixtla.s3.amazonaws.com/air-passengers.csv', parse_dates=['ds'])
     df.rename(columns={'unique_id': 'series_id', 'ds': 'date', 'y': 'value'}, inplace=True)
     df['month'] = df['date'].dt.month
@@ -76,12 +131,12 @@ class HyperTreeNetAR:
     model.train(
         lgb_params={'learning_rate': 1e-1},
         network_params={
-        'learning_rate': 1e-3,             # learning rate for the neural network optimizer
-        'embedding_dimension': 1,          # embedding dimension for tree-embeddings
-        'hidden_dim': 128,                 # hidden dimension for the MLP network
-        'dropout': 0.1,                    # dropout rate for the MLP network
-        'use_random_projection': True,     # whether to use random projections for the embeddings
-        'rp_embed_dim': 12,                # dimension of the random projections (if used)
+            'learning_rate': 1e-3,             # learning rate for the neural network optimizer
+            'embedding_dimension': 1,          # embedding dimension for tree-embeddings
+            'hidden_dim': 128,                 # hidden dimension for the MLP network
+            'dropout': 0.1,                    # dropout rate for the MLP network
+            'use_random_projection': True,     # whether to use random projections for the embeddings
+            'rp_embed_dim': lag_p + lag_q,     # dimension of the random projections (if used)
         },
         num_iterations=100,
         train_data=train,
@@ -89,8 +144,9 @@ class HyperTreeNetAR:
         verbose=-1
     )
 
-    # Generate forecasts
+    # Generate forecasts and inspect the time-varying ARMA coefficients
     forecasts = model.forecast(test_data=test)
+    coefficients = model.forecast(test_data=test, type="parameters")
 
     # Plot results
     datasets = [
@@ -108,23 +164,29 @@ class HyperTreeNetAR:
     plt.tight_layout()
     ```
     """
+
     def __init__(
             self,
             p: int = 2,
+            q: int = 1,
             freq: str = "M",
             fcst_h: int = 1,
             loss_fn: Callable = nn.MSELoss(),
             device: str = "cpu",
             hessian_method: str = "exact",
             n_hessian_probes: int = 5,
+            stage1_p: Optional[int] = None,
     ):
         """
-        Initialize the Hyper-TreeNet-AR(p) model.
+        Initialize the Hyper-TreeNet-ARMA(p, q) model.
 
         Arguments
         ----------
         p : int
-            Maximum number of AR(p) lags. Must be a positive integer.
+            Number of AR lags. Must be a positive integer.
+        q : int
+            Number of MA terms (lagged residual regressors). Must be a
+            positive integer; for q = 0 use ``HyperTreeNetAR`` directly.
         freq : str
             Frequency of the time series (e.g., 'D' for daily, 'M' for monthly,
             'Q' for quarterly, 'Y' for yearly).
@@ -151,10 +213,25 @@ class HyperTreeNetAR:
             Number of Hutchinson probes for Gauss-Newton Hessian diagonal estimation.
             Only used when hessian_method="gn". More probes reduce variance but
             increase computation. Default is 5.
+        stage1_p : int, optional
+            Lag order of the stage-1 autoregression used to extract the
+            residual proxies (the Hannan-Rissanen "long AR"). If None
+            (default), it is resolved at training time via the
+            Gomez-Maravall (2001) proposal used by statsmodels and RATS:
+            ``max(floor(log(T)**2), 2 * max(p, q))``, with ``T`` the
+            shortest series length. Larger values give cleaner residual
+            proxies at the cost of dropping more training rows: stage-2
+            training uses rows from ``max(p, stage1_p + q) + 1`` onward per
+            series. Pass a smaller value explicitly for short series.
         """
         # Validate inputs
-        if p <= 0:
+        if not isinstance(p, int) or p <= 0:
             raise ValueError("Parameter 'p' must be a positive integer.")
+        if not isinstance(q, int) or q <= 0:
+            raise ValueError(
+                "Parameter 'q' must be a positive integer. For q = 0 (no MA "
+                "terms) use HyperTreeNetAR directly."
+            )
         if fcst_h <= 0:
             raise ValueError("Forecast horizon 'fcst_h' must be a positive integer.")
         if not isinstance(freq, str):
@@ -178,10 +255,12 @@ class HyperTreeNetAR:
             raise ValueError("hessian_method must be either 'exact' or 'gn'.")
         if not isinstance(n_hessian_probes, int) or n_hessian_probes <= 0:
             raise ValueError("n_hessian_probes must be a positive integer.")
+        if stage1_p is not None and (not isinstance(stage1_p, int) or stage1_p <= 0):
+            raise ValueError("stage1_p must be a positive integer.")
 
         if hessian_method == "gn" and not isinstance(loss_fn, nn.MSELoss):
             warnings.warn(
-                f"Loss {type(loss_fn).__name__} is not nn.MSELoss. The Gauss-Newton "
+                f"Loss {loss_fn.__class__.__name__} is not nn.MSELoss. The Gauss-Newton "
                 "Hessian requires a twice-differentiable loss; non-smooth losses "
                 "(e.g., L1Loss, quantile loss, HuberLoss/SmoothL1Loss outside the quadratic "
                 "region) have zero or undefined second derivatives at kinks, "
@@ -189,6 +268,10 @@ class HyperTreeNetAR:
             )
 
         self.p = p
+        self.q = q
+        self.n_params = p + q
+        self._stage1_p_arg = stage1_p
+        self.stage1_p = stage1_p  # resolved at training time when None
         self.freq = freq
         self.fcst_h = fcst_h
         self.loss_fn = loss_fn
@@ -201,15 +284,22 @@ class HyperTreeNetAR:
         self.dataset_references = {}  # Store references to LightGBM datasets
         self.hessian_method = hessian_method
         self.n_hessian_probes = n_hessian_probes
+        self.network = None
+        self.optimizer = None
+        self.embedding_dim = None
+        self._stage1 = None  # Trained stage-1 HyperTreeAR (residual extractor)
+        self.fcst_lags = None  # {series_id: last p values, newest first}
+        self.fcst_eps = None   # {series_id: last q stage-1 residuals, newest first}
         self._iter_count = 0
         self._fit = None
         self._target = None
 
-        # Conformal prediction interval state
+        # Conformal prediction interval state (populated when train() is called
+        # with forecast_intervals).
         self._is_calibrated = False
-        self._cs_scores = None
-        self._cs_series_order = None
-        self._pi_config = None
+        self._cs_scores = None          # conformity scores (n_windows, n_series, fcst_h)
+        self._cs_series_order = None    # series order along axis 1 of _cs_scores
+        self._pi_config = None          # ForecastIntervals configuration
 
         if hessian_method == "gn":
             self._gn_hessian = GaussNewtonHessian(loss_fn, n_hessian_probes, self.dtype)
@@ -219,8 +309,9 @@ class HyperTreeNetAR:
         Custom objective function for LightGBM training.
 
         This function defines the gradients and hessians for the LightGBM model
-        based on the PyTorch loss function. It converts the raw LightGBM outputs to
-        PyTorch tensors, computes the loss, and then backpropagates to get gradients.
+        based on the PyTorch loss function. It converts the raw LightGBM outputs
+        to embeddings, updates the MLP, computes the loss through the updated
+        network, and then backpropagates to get gradients.
 
         Parameters
         ----------
@@ -237,11 +328,10 @@ class HyperTreeNetAR:
         self._iter_count += 1
 
         target = torch.tensor(data.get_label().reshape(-1, 1), dtype=self.dtype, device=self.device)
-        embeds, loss = self.get_embeds_loss(predt, target, self.lags_train, requires_grad=True)
+        embeds, loss = self.get_embeds_loss_separate(predt, target, self.design_train)
         grad, hess = self.calculate_gradients_and_hessians(loss, embeds)
 
         return grad, hess
-
 
     def eval_fn(self, predt: np.ndarray, eval_data: lgb.Dataset) -> Tuple[str, float, bool]:
         """
@@ -261,16 +351,16 @@ class HyperTreeNetAR:
         Tuple[str, float, bool]
             Name of the metric, value of the metric, and whether to maximize it.
         """
-        # Use appropriate lags based on dataset name
+        # Use appropriate design rows based on dataset name
         dataset_name = self.dataset_references.get(id(eval_data), "unknown")
         if dataset_name == "train":
-            lags = self.lags_train
+            design = self.design_train
         elif dataset_name == "validation":
-            lags = self.lags_eval
+            design = self.design_eval
         else:
-            # Default to training lags if unknown
-            lags = self.lags_train
-            warnings.warn("Unknown dataset in metric_fn. Using training lags.")
+            # Default to training design if unknown
+            design = self.design_train
+            warnings.warn("Unknown dataset in metric_fn. Using training design.")
 
         # Calculate loss
         is_higher_better = False  # Lower loss is better, so we don't maximize
@@ -288,8 +378,8 @@ class HyperTreeNetAR:
         # Compute loss without gradients
         self.network.eval()
         with torch.no_grad():
-            ar_params = self.network(gbdt_embed)
-            fcst = torch.sum(ar_params * lags, dim=1).unsqueeze(1)
+            arma_params = self.network(gbdt_embed)
+            fcst = torch.sum(arma_params * design, dim=1).unsqueeze(1)
             loss = self.loss_fn(fcst, target)
 
         return self.loss_name, loss.item(), is_higher_better
@@ -298,18 +388,16 @@ class HyperTreeNetAR:
             self,
             predt: np.ndarray,
             target: torch.Tensor,
-            lags: torch.Tensor = None,
-            requires_grad: bool = False
-    ) -> Tuple[
-        torch.Tensor, torch.Tensor]:
+            design: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Transform LightGBM outputs into embeddings and calculate loss for separate gradients (Option 2).
 
         This function:
         1. Reshapes the raw outputs into tree embeddings
-        2. Maps embeddings to AR parameters via the MLP
-        3. Computes the forecast by multiplying AR parameters with lags and summing
-        4. Calculates the loss between forecasts and actual values
+        2. Maps embeddings to ARMA coefficients via the MLP and takes one optimizer step
+        3. Recomputes the coefficients through the updated network in inference mode
+        4. Calculates the GBDT loss between fitted and actual values
 
         Parameters
         ----------
@@ -317,10 +405,9 @@ class HyperTreeNetAR:
             Raw outputs from LightGBM.
         target : torch.Tensor
             Target values (actual time series values).
-        lags : torch.Tensor
-            Lagged values of the time series.
-        requires_grad : bool
-            Whether to compute gradients (True during training).
+        design : torch.Tensor
+            Joint design rows ``[y_{t-1..t-p}, eps_hat_{t-1..t-q}]``,
+            shape ``(n_samples, p + q)``.
 
         Returns
         -------
@@ -331,15 +418,15 @@ class HyperTreeNetAR:
         # The 'F' order means Fortran-style ordering (column-major)
         gbdt_embed = torch.tensor(
             predt.reshape(-1, self.embedding_dim, order="F"),
-            requires_grad = requires_grad,
-            dtype = self.dtype,
+            requires_grad=True,
+            dtype=self.dtype,
             device=self.device
         )
 
         # Train network (forward pass)
         self.network.train()
-        ar_params_net = self.network(gbdt_embed)
-        fcst_net = torch.sum(ar_params_net * lags, dim=1).unsqueeze(1)
+        arma_params_net = self.network(gbdt_embed)
+        fcst_net = torch.sum(arma_params_net * design, dim=1).unsqueeze(1)
         network_loss = self.loss_fn(fcst_net, target)
         self.optimizer.zero_grad()
         network_loss.backward()
@@ -347,8 +434,8 @@ class HyperTreeNetAR:
 
         # Calculate loss for GBDT
         self.network.eval()
-        ar_params_gbdt = self.network(gbdt_embed)
-        fcst_gbdt = torch.sum(ar_params_gbdt * lags, dim=1).unsqueeze(1)
+        arma_params_gbdt = self.network(gbdt_embed)
+        fcst_gbdt = torch.sum(arma_params_gbdt * design, dim=1).unsqueeze(1)
         gbm_loss = self.loss_fn(fcst_gbdt, target)
 
         if self.hessian_method == "gn":
@@ -357,68 +444,9 @@ class HyperTreeNetAR:
 
         return gbdt_embed, gbm_loss
 
-    def get_embeds_loss_shared(
-            self,
-            predt: np.ndarray,
-            target: torch.Tensor,
-            lags: torch.Tensor = None,
-            requires_grad: bool = False
-    ) -> Tuple[
-        torch.Tensor, torch.Tensor]:
-        """
-        Transform LightGBM outputs into embeddings and calculate loss for shared gradients (Option 1).
-
-        This function:
-        1. Reshapes the raw outputs into tree embeddings
-        2. Maps embeddings to AR parameters via the MLP
-        3. Computes the forecast by multiplying AR parameters with lags and summing
-        4. Calculates the loss between forecasts and actual values
-
-        Parameters
-        ----------
-        predt : np.ndarray
-            Raw outputs from LightGBM.
-        target : torch.Tensor
-            Target values (actual time series values).
-        lags : torch.Tensor
-            Lagged values of the time series.
-        requires_grad : bool
-            Whether to compute gradients (True during training).
-
-        Returns
-        -------
-        Tuple[torch.Tensor, torch.Tensor]
-            GBDT embeddings and shared loss.
-        """
-        # Clear existing gradients
-        self.optimizer.zero_grad()
-        self.network.train()
-
-        # Reshape outputs into embedding matrix (samples × embedding_dim)
-        # The 'F' order means Fortran-style ordering (column-major)
-        predt = torch.tensor(
-            predt.reshape(-1, self.embedding_dim, order="F"),
-            dtype=self.dtype
-        ).to(self.device)
-
-        # Convert to PyTorch network parameter
-        gbdt_embed = nn.Parameter(predt, requires_grad=requires_grad)
-
-        # Forward pass of the network
-        ar_params = self.network(gbdt_embed)
-        fcst = torch.sum(ar_params * lags, dim=1, dtype=torch.float32).unsqueeze(1)
-        shared_loss = self.loss_fn(fcst, target)
-
-        if self.hessian_method == "gn":
-            self._fit = fcst
-            self._target = target
-
-        # Back propagation for the network
-        shared_loss.backward(create_graph=True)
-
-        return gbdt_embed, shared_loss
-
-    def _calculate_gradients_and_hessians_separate(self, loss: torch.Tensor, embeds: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
+    def _calculate_gradients_and_hessians_separate(
+            self, loss: torch.Tensor, embeds: torch.Tensor,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Compute gradients and hessians for LightGBM optimization using separate gradients (Option 2).
 
@@ -452,8 +480,9 @@ class HyperTreeNetAR:
 
         return grad, hess
 
-
-    def _calculate_gradients_and_hessians_separate_gn(self, loss: torch.Tensor, embeds: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
+    def _calculate_gradients_and_hessians_separate_gn(
+            self, loss: torch.Tensor, embeds: torch.Tensor,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """Gauss-Newton Hessian for separate gradient mode via Hutchinson probing.
 
         Parameters
@@ -478,78 +507,56 @@ class HyperTreeNetAR:
 
         return grad, hess
 
-    def _calculate_gradients_and_hessians_shared(self, loss: torch.Tensor, embeds: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Compute gradients and hessians for LightGBM optimization using shared gradients (Option 1).
+    def _stage1_residual_frame(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Attach the stage-1 in-sample residuals to a sorted copy of *data*.
 
-        This function computes first and second-order derivatives needed for
-        gradient boosting optimization in LightGBM.
-
-        Parameters
-        ----------
-        loss : torch.Tensor
-            Loss value from the model.
-        embeds : torch.Tensor
-            GBDT embeddings.
-
-        Returns
-        -------
-        Tuple[np.ndarray, np.ndarray]
-            Gradients and hessians as numpy arrays in the format expected by LightGBM.
-        """
-        # Compute gradients
-        grad = embeds.grad
-        hess = [
-            autograd(grad[:, i].sum(), embeds, retain_graph=True)[0][:, i:(i + 1)]
-            for i in range(self.embedding_dim)
-        ]
-
-        grad = grad.cpu().detach().numpy().ravel(order="F")
-        hess = torch.cat(hess, dim=1).cpu().detach().numpy().ravel(order="F")
-
-        # Update network parameters
-        self.optimizer.step()
-
-        # Clear existing gradients to prevent accumulation
-        embeds.grad = None
-        self.optimizer.zero_grad()
-
-        return grad, hess
-
-    def _calculate_gradients_and_hessians_shared_gn(self, loss: torch.Tensor, embeds: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
-        """Gauss-Newton Hessian for shared gradient mode via Hutchinson probing.
+        Runs the trained stage-1 AR over *data* to compute its one-step
+        in-sample residuals ``eps_hat_t = y_t - y_hat_t``. The first
+        ``stage1_p`` rows of each series have no stage-1 fit and carry NaN.
 
         Parameters
         ----------
-        loss : torch.Tensor
-            Loss value from the model (already backpropagated by
-            ``get_embeds_loss_shared``, which populates ``embeds.grad``).
-        embeds : torch.Tensor
-            GBDT embeddings, shape ``(n_samples, embedding_dim)``.
+        data : pd.DataFrame
+            DataFrame with ``series_id``, ``date``, ``value`` and the
+            training feature columns, ordered by ``(series_id, date)``.
 
         Returns
         -------
-        Tuple[np.ndarray, np.ndarray]
-            Gradients and hessians as numpy arrays in the format expected by LightGBM.
+        pd.DataFrame
+            Copy of *data*, sorted by ``(series_id, date)``, with an added
+            ``resid`` column (NaN for the first ``stage1_p`` rows per series).
         """
-        grad = embeds.grad
-        rng = torch.Generator().manual_seed(self._iter_count)
-        hess = self._gn_hessian.estimate(self._fit, self._target, embeds, rng)
-        self._fit = None
-        self._target = None
-        grad = grad.cpu().detach().numpy().ravel(order="F")
-        hess = hess.cpu().detach().numpy().ravel(order="F")
-        self.optimizer.step()
-        embeds.grad = None
-        self.optimizer.zero_grad()
+        preprocessor = TimeSeriesPreprocessor(
+            freq=self.freq,
+            lags=[i for i in range(1, self.stage1_p + 1)],
+        )
+        lagged = preprocessor.create_lags(data)
+        lagged_dict = preprocessor.extract(lagged)
 
-        return grad, hess
+        # Predict the stage-1 AR coefficients on the lagged rows; enforce the
+        # stage-1 model's training feature order for the Booster.
+        params = np.asarray(
+            self._stage1.model.predict(lagged_dict["features"][self._stage1.features])
+        )
+        # Booster.predict returns (n_rows, stage1_p) for multi-class output
+        if params.ndim == 1:
+            params = params.reshape(-1, self.stage1_p)
+        fit = (params * lagged_dict["lags_target"]).sum(axis=1)
+        resid = lagged_dict["target"].ravel() - fit
+
+        # Align back: `lagged` equals the sorted frame minus the first
+        # stage1_p rows of each series, in the same row order.
+        work = data.sort_values(["series_id", "date"]).reset_index(drop=True).copy()
+        occ = work.groupby("series_id", sort=False).cumcount()
+        work["resid"] = np.nan
+        work.loc[occ >= self.stage1_p, "resid"] = resid
+
+        return work
 
     def train(
             self,
             lgb_params: dict = None,
             network_params: dict = None,
-            gradient_mode: str = "separate",
             num_iterations: int = 100,
             train_data: pd.DataFrame = None,
             validation: bool = False,
@@ -560,12 +567,15 @@ class HyperTreeNetAR:
             forecast_intervals: Optional[ForecastIntervals] = None,
     ) -> TrainingResult:
         """
-        Train the Hyper-TreeNet-AR model on time series data.
+        Train the Hyper-TreeNet-ARMA model on time series data.
 
         This method:
-        1. Preprocesses the time series data to create lag features
-        2. Sets up LightGBM datasets
-        3. Trains the models
+        1. Trains the stage-1 long autoregression (a direct ``HyperTreeAR`` of
+           order ``stage1_p``) with the same LightGBM hyper-parameters and
+           extracts its in-sample one-step residuals (Hannan-Rissanen)
+        2. Builds the joint design ``[y-lags, residual-lags]`` and sets up
+           LightGBM datasets
+        3. Trains the stage-2 GBDT encoder and MLP decoder jointly
 
         The training data must contain columns:
         - 'series_id': Identifier for each time series
@@ -573,10 +583,17 @@ class HyperTreeNetAR:
         - 'value': Target value to forecast
         - Additional feature columns used for forecasting
 
+        Each series must have at least ``max(p, stage1_p + q) + 1`` rows so
+        that one stage-2 training row remains. Note that the stage-1 model is
+        fitted on the full training data, so with ``validation=True`` the
+        validation metric shares stage-1 information through the residual
+        regressors.
+
         Parameters
         ----------
         lgb_params : dict
-            LightGBM parameters
+            LightGBM parameters like 'learning_rate', 'num_leaves', etc.
+            Used for both the stage-1 and the stage-2 GBDT.
         network_params : dict
             Network parameters. Available parameters are:
                 - "learning_rate": Learning rate for the neural network optimizer
@@ -585,13 +602,8 @@ class HyperTreeNetAR:
                 - "use_random_projection": Whether to use random projection for embeddings
                 - "rp_embed_dim": Dimension of the random projection embeddings (if used)
                 - "dropout": Dropout rate for regularization
-        gradient_mode : str
-            Gradient mode for MLP and GBM interaction. Options are:
-                - "shared": Use shared gradients for both MLP and GBM (Option 1 in the paper)
-                - "separate": Train MLP separately from GBM gradient computation (Option 2 in the paper)
-            Default is "separate".
         num_iterations : int
-            Number of boosting rounds for training
+            Number of boosting rounds for training (both stages)
         train_data : pd.DataFrame
             Training data containing series_id, date, value and feature columns
         validation : bool
@@ -617,7 +629,8 @@ class HyperTreeNetAR:
         Returns
         -------
         TrainingResult
-            Object containing evaluation results and training information.
+            Object containing evaluation results and training information
+            for the stage-2 model.
         """
         # Validate inputs
         if train_data is None:
@@ -626,8 +639,6 @@ class HyperTreeNetAR:
             raise ValueError("lgb_params must be provided.")
         if network_params is None:
             raise ValueError("network_params must be provided.")
-        if gradient_mode not in ["shared", "separate"]:
-            raise ValueError("gradient_mode must be either 'shared' or 'separate'.")
         if not isinstance(train_data, pd.DataFrame):
             raise TypeError("train_data must be a pandas DataFrame.")
         if not isinstance(lgb_params, dict):
@@ -669,9 +680,6 @@ class HyperTreeNetAR:
         if deterministic:
             lgb_params = {**lgb_params, "deterministic": True, "force_row_wise": True}
 
-        # Store the training mode
-        self.gradient_mode = gradient_mode
-
         # Check required columns
         required_columns = ['series_id', 'date', 'value']
         for col in required_columns:
@@ -679,75 +687,52 @@ class HyperTreeNetAR:
                 raise ValueError(f"Required column '{col}' not found in training data.")
 
         # Validate row ordering: each series must be a contiguous block with
-        # monotonic dates so the training reshape and fcst_lags extraction align.
+        # monotonic dates so the training reshape and forecast seeds align.
         validate_series_order(train_data, name="train_data")
 
-        # Each series must keep at least one training row after lagging; a
-        # shorter series would silently contribute nothing while leaving a
-        # ragged forecast seed behind.
+        # Resolve the stage-1 long-AR order. The default follows the
+        # Gomez-Maravall (2001) proposal used by statsmodels'
+        # hannan_rissanen and RATS' @HannanRissanen: the long AR grows with
+        # the sample so the residual proxies stay consistent.
         lengths = train_data.groupby("series_id", sort=False).size()
-        bad = lengths[lengths <= self.p]
+        if self._stage1_p_arg is not None:
+            self.stage1_p = self._stage1_p_arg
+        else:
+            t_min = int(lengths.min())
+            self.stage1_p = max(
+                int(np.floor(np.log(t_min) ** 2)), 2 * max(self.p, self.q)
+            )
+
+        # Each series must keep at least one stage-2 training row.
+        needed = max(self.p, self.stage1_p + self.q) + 1
+        bad = lengths[lengths < needed]
         if len(bad) > 0:
             raise ValueError(
-                f"Each series needs at least p + 1 = {self.p + 1} observations "
-                f"so that one training row remains after lagging, but these "
-                f"series are too short: {bad.to_dict()}."
+                f"Series too short for stage1_p={self.stage1_p} and q={self.q}: "
+                f"each series needs at least max(p, stage1_p + q) + 1 = {needed} "
+                f"rows, but these series are shorter: {bad.to_dict()}. Pass a "
+                f"smaller stage1_p to HyperTreeNetARMA for short series."
             )
 
+        # Fail fast if any series is too short for the requested conformal
+        # calibration. The stage-2 ARMA needs max(p, stage1_p + q) + 1 rows to
+        # retain one training sample.
         if forecast_intervals is not None:
             validate_calibration_length(
-                train_data, self.fcst_h, forecast_intervals, min_train=self.p + 1
+                train_data, self.fcst_h, forecast_intervals,
+                min_train=max(self.p, self.stage1_p + self.q) + 1,
             )
 
-        # Set the network and optimizer
-        gbdt_params = lgb_params.copy()
+        # Set the embedding dimension and select the gradient computation
+        # based on the Hessian method
         self.embedding_dim = network_params["embedding_dimension"]
+        if self.hessian_method == "exact":
+            self.calculate_gradients_and_hessians = self._calculate_gradients_and_hessians_separate
+        else:
+            self.calculate_gradients_and_hessians = self._calculate_gradients_and_hessians_separate_gn
 
-        # Seed torch before constructing the MLP so initialization (and dropout
-        # draws during training) are reproducible even when the random
-        # projection layer -- whose constructor reseeds torch -- is disabled.
-        torch.manual_seed(seed)
-
-        self.network = MLP(
-            tree_embed_dim=self.embedding_dim,
-            output_dim=self.p,
-            hidden_dim=network_params["hidden_dim"],
-            use_random_projection=network_params["use_random_projection"],
-            rp_embed_dim=network_params["rp_embed_dim"] if network_params["use_random_projection"] else None,
-            dropout_rate=network_params["dropout"],
-            seed=seed
-        ).to(self.device)
-        self.optimizer = torch.optim.Adam(self.network.parameters(), lr=network_params["learning_rate"])
-
-        # Reset state for re-training
-        self._iter_count = 0
-        self._fit = None
-        self._target = None
-        self.model = None
-        self.dataset_references = {}
-        self.is_trained = False
-        self.features = None
-        self._is_calibrated = False
-        self._cs_scores = None
-        self._cs_series_order = None
-        self._pi_config = None
-
-        # Select objective function based on training mode and Hessian method
-        if self.gradient_mode == "separate":
-            self.get_embeds_loss = self.get_embeds_loss_separate
-            if self.hessian_method == "exact":
-                self.calculate_gradients_and_hessians = self._calculate_gradients_and_hessians_separate
-            else:
-                self.calculate_gradients_and_hessians = self._calculate_gradients_and_hessians_separate_gn
-        elif self.gradient_mode == "shared":
-            self.get_embeds_loss = self.get_embeds_loss_shared
-            if self.hessian_method == "exact":
-                self.calculate_gradients_and_hessians = self._calculate_gradients_and_hessians_shared
-            else:
-                self.calculate_gradients_and_hessians = self._calculate_gradients_and_hessians_shared_gn
-
-        # GBDT parameters. The objective wrapper stops lgb.train's params
-        # deepcopy from cloning this instance (see NoDeepcopyObjective).
+        # General model parameters. The objective wrapper stops lgb.train's
+        # params deepcopy from cloning this instance (see NoDeepcopyObjective).
         self.lgb_params = {
             "num_class": self.embedding_dim,
             "objective": NoDeepcopyObjective(self.objective_fn),
@@ -757,17 +742,73 @@ class HyperTreeNetAR:
         }
 
         # Update with user-provided LightGBM parameters
-        self.lgb_params.update(gbdt_params)
+        self.lgb_params.update(lgb_params)
+
+        # Reset state for re-training
+        self._iter_count = 0
+        self._fit = None
+        self._target = None
+        self.model = None
+        self.network = None
+        self.optimizer = None
+        self._stage1 = None
+        self.fcst_lags = None
+        self.fcst_eps = None
+        self.dataset_references = {}
+        self.is_trained = False
+        self.features = None
+        self._is_calibrated = False
+        self._cs_scores = None
+        self._cs_series_order = None
+        self._pi_config = None
 
         try:
-            # Initialize TimeSeriesPreprocessor for creating lagged dataframe
+            # Stage 1 (Hannan-Rissanen): fit the long autoregression and
+            # extract its in-sample one-step residuals as MA-term proxies.
+            self._stage1 = HyperTreeAR(
+                p=self.stage1_p,
+                freq=self.freq,
+                fcst_h=self.fcst_h,
+                loss_fn=self.loss_fn,
+                hessian_method="analytic",
+            )
+            self._stage1.train(
+                lgb_params=lgb_params,
+                num_iterations=num_iterations,
+                train_data=train_data,
+                validation=False,
+                seed=seed,
+                verbose=verbose,
+                deterministic=deterministic,
+            )
+            work = self._stage1_residual_frame(train_data)
+
+            # Stage 2: build the joint design. The y-lags come from the
+            # standard preprocessor; the residual lags are appended as
+            # lag{p+1}..lag{p+q} so the shared extract()/prepare_datasets
+            # machinery picks up the joint [y-lags | eps-lags] design as one
+            # (n_samples, p + q) tensor while keeping the residual columns
+            # out of the GBDT feature set.
             preprocessor = TimeSeriesPreprocessor(
                 freq=self.freq,
                 lags=[i for i in range(1, self.p + 1)],
             )
+            full_ts = preprocessor.create_lags(work.drop(columns=["resid"]))
 
-            # Process full dataset to create lagged dataframe
-            full_ts = preprocessor.create_lags(train_data)
+            resid_grouped = work.groupby("series_id", sort=False)["resid"]
+            elag_names = []
+            elags = {}
+            for i in range(1, self.q + 1):
+                name = f"lag{self.p + i}"
+                elags[name] = resid_grouped.shift(i)
+                elag_names.append(name)
+            occ = work.groupby("series_id", sort=False).cumcount()
+            elag_df = pd.DataFrame(elags)[(occ >= self.p).to_numpy()].reset_index(drop=True)
+            full_ts = pd.concat([full_ts, elag_df], axis=1)
+            # Drop rows without q valid residual lags (the head of each
+            # series up to stage1_p + q observations).
+            full_ts = full_ts.dropna(subset=elag_names).reset_index(drop=True)
+
             full_dict = preprocessor.extract(full_ts)
 
             # Store feature names for later use
@@ -778,8 +819,8 @@ class HyperTreeNetAR:
              valid_names,
              callbacks,
              evals_result,
-             lags_train,
-             lags_eval,
+             design_train,
+             design_eval,
              self.dataset_references) = (
                 prepare_datasets(
                     full_ts=full_ts,
@@ -791,14 +832,30 @@ class HyperTreeNetAR:
                 )
             )
 
-            # Store lagged values for training and evaluation
-            self.lags_train = lags_train.to(self.device) if lags_train is not None else None
-            self.lags_eval = lags_eval.to(self.device) if lags_eval is not None else None
+            # Store design rows for training and evaluation
+            self.design_train = design_train.to(self.device) if design_train is not None else None
+            self.design_eval = design_eval.to(self.device) if design_eval is not None else None
 
-            # Store lagged train values to be used in the forecast method
+            # Store the value and residual seeds to be used in the forecast method
             self.set_forecast_origin(train_data)
 
-            # Train model
+            # Seed torch before constructing the MLP so initialization (and dropout
+            # draws during training) are reproducible even when the random
+            # projection layer -- whose constructor reseeds torch -- is disabled.
+            torch.manual_seed(seed)
+
+            self.network = MLP(
+                tree_embed_dim=self.embedding_dim,
+                output_dim=self.n_params,
+                hidden_dim=network_params["hidden_dim"],
+                use_random_projection=network_params["use_random_projection"],
+                rp_embed_dim=network_params["rp_embed_dim"] if network_params["use_random_projection"] else None,
+                dropout_rate=network_params["dropout"],
+                seed=seed
+            ).to(self.device)
+            self.optimizer = torch.optim.Adam(self.network.parameters(), lr=network_params["learning_rate"])
+
+            # Train LightGBM model
             start_time = time.time()
             self.model = lgb.train(
                 self.lgb_params,
@@ -814,22 +871,26 @@ class HyperTreeNetAR:
             # Set trained flag to True
             self.is_trained = True
 
+            # Calibrate conformal prediction intervals via rolling-window CV.
+            # Fresh model instances are trained per window (no forecast_intervals
+            # passed, so there is no recursion) using the same hyper-parameters.
             if forecast_intervals is not None:
                 def _model_factory():
-                    return HyperTreeNetAR(
+                    return HyperTreeNetARMA(
                         p=self.p,
+                        q=self.q,
                         freq=self.freq,
                         fcst_h=self.fcst_h,
                         loss_fn=self.loss_fn,
                         device=self.device,
                         hessian_method=self.hessian_method,
                         n_hessian_probes=self.n_hessian_probes,
+                        stage1_p=self.stage1_p,
                     )
 
                 cal_train_kwargs = dict(
                     lgb_params=lgb_params,
                     network_params=network_params,
-                    gradient_mode=gradient_mode,
                     num_iterations=num_iterations,
                     validation=False,
                     seed=seed,
@@ -857,41 +918,72 @@ class HyperTreeNetAR:
 
             return result
 
-
         except Exception as e:
             self.is_trained = False
             raise RuntimeError(f"Training failed: {str(e)}") from e
 
     def set_forecast_origin(self, history: pd.DataFrame) -> None:
-        """Re-anchor the AR lag seed to the end of *history* without retraining.
+        """Re-anchor the ARMA value and residual seeds to the end of *history*.
+
+        Recomputes the last ``p`` observed values and the last ``q`` stage-1
+        residuals per series without retraining either GBDT. Used by conformal
+        calibration with ``refit=False``.
 
         Parameters
         ----------
         history : pd.DataFrame
-            DataFrame with ``series_id``, ``date``, ``value`` columns, ordered
-            by ``(series_id, date)`` with each series in a contiguous block.
+            DataFrame with ``series_id``, ``date``, ``value`` and the training
+            feature columns, ordered by ``(series_id, date)`` with each series
+            in a contiguous block. Each series must have at least
+            ``max(p, stage1_p + q)`` observations so that the residual seed
+            exists.
         """
+        if self._stage1 is None or self._stage1.model is None:
+            raise RuntimeError("set_forecast_origin requires a trained model.")
         validate_series_order(history, name="history")
+
+        needed = max(self.p, self.stage1_p + self.q)
+        lengths = history.groupby("series_id", sort=False).size()
+        bad = lengths[lengths < needed]
+        if len(bad) > 0:
+            raise ValueError(
+                f"history must contain at least max(p, stage1_p + q) = {needed} "
+                f"observations per series. Series too short: {bad.to_dict()}."
+            )
+
+        # Value seed: last p observations per series, newest first.
         self.fcst_lags = extract_forecast_lags(history, self.p)
+
+        # Residual seed: last q stage-1 residuals per series, newest first.
+        # The stage-1 residuals are the same quantities the MA coefficients
+        # multiplied during training, keeping train and forecast consistent.
+        work = self._stage1_residual_frame(history)
+        tail = work.groupby("series_id", sort=False).tail(self.q)
+        self.fcst_eps = {
+            sid: grp["resid"].to_numpy()[::-1]
+            for sid, grp in tail.groupby("series_id", sort=False)
+        }
 
     def forecast(
             self,
             test_data: pd.DataFrame,
             type: str = "forecast",
-            level: Optional[List[int]] = None,
+            level: Optional[List[int]] = None
     ) -> pd.DataFrame:
         """
         Generate forecasts using the trained model.
 
         This method:
-        1. Uses the trained model to forecast AR coefficients for each test point
-        2. Recursively generates forecasted values using the forecasted AR coefficients
+        1. Uses the trained model to forecast ARMA coefficients for each test point
+        2. Recursively generates forecasts using the forecasted coefficients
 
-        The forecasting process implements an autoregressive model where:
-        y_t = φ₁(x)y_{t-1} + φ₂(x)y_{t-2} + ... + φₚ(x)y_{t-p}
+        The forecasting process implements an ARMA model where:
+        y_t = φ₁(x)y_{t-1} + ... + φₚ(x)y_{t-p} + θ₁(x)ε_{t-1} + ... + θ_q(x)ε_{t-q}
 
-        However, unlike traditional AR models, the φ(x) coefficients are not constant
-        but determined by the LightGBM model based on features x.
+        Past residuals at the forecast origin are known (stage-1 in-sample
+        errors); future innovations are unobserved with expectation zero, so
+        the MA terms correct the first q horizon steps and then vanish,
+        leaving the pure AR recursion.
 
         Parameters
         ----------
@@ -901,7 +993,7 @@ class HyperTreeNetAR:
         type : str
             Type of forecast to generate. Options:
             - "forecast": Generate forecasted values
-            - "parameters": Return the AR(p) coefficients used for forecasting
+            - "parameters": Return the ARMA coefficients used for forecasting
             - "tree_embeddings": Return the tree embeddings
         level : list of int, optional
             Confidence levels (in ``(0, 100)``, e.g. ``[80, 90]``) for conformal
@@ -917,8 +1009,8 @@ class HyperTreeNetAR:
             - date: Forecast date/time
             - fcst: Forecasted value (if type="forecast")
             - model: Model name identifier
-            - AR(i) for i=1..p: AR coefficient values (if type="parameters")
-            - tree_embedding_{i} for i=1..embedding_dim: GBDT tree-embedding dimensions (if type="tree_embeddings")
+            - AR(j) / MA(i): coefficient values (if type="parameters")
+            - tree_embedding_{i}: GBDT tree-embedding dimensions (if type="tree_embeddings")
             - <model>-lo-<level> / <model>-hi-<level>: prediction interval bounds
               (if type="forecast" and level is provided)
         """
@@ -933,7 +1025,7 @@ class HyperTreeNetAR:
                 raise ValueError(f"Required column '{col}' not found in test_data")
 
         # Validate row ordering: each series must be a contiguous block with
-        # monotonic dates so the forecast reshape aligns forecasts with lags.
+        # monotonic dates so the forecast reshape aligns forecasts with seeds.
         validate_series_order(test_data, name="test_data")
 
         # Validate series IDs match training data
@@ -949,8 +1041,8 @@ class HyperTreeNetAR:
                 parts.append(f"Extra series not in test_data: {extra}")
             raise ValueError(". ".join(parts))
 
-        # Validate rows per series matches forecast horizon (forecast only;
-        # parameters/embeddings can be requested for arbitrary-length input).
+        # Validate rows per series matches fcst_h (forecast only; parameters
+        # and embeddings can be requested for arbitrary-length input).
         if type == "forecast":
             rows_per_series = test_data.groupby("series_id", sort=False).size()
             bad = rows_per_series[rows_per_series != self.fcst_h]
@@ -969,6 +1061,7 @@ class HyperTreeNetAR:
         if type not in ["forecast", "parameters", "tree_embeddings"]:
             raise ValueError("Parameter 'type' must be either 'forecast', 'parameters' or 'tree_embeddings'.")
 
+        # Validate conformal interval request
         if level is not None:
             if type != "forecast":
                 raise ValueError("level is only supported with type='forecast'.")
@@ -983,6 +1076,8 @@ class HyperTreeNetAR:
             for lv in level:
                 if not isinstance(lv, (int, np.integer)) or not 0 < lv < 100:
                     raise ValueError(f"level values must be integers in (0, 100); got {lv}.")
+
+        model_name = f"Hyper-TreeNet-ARMA({self.p},{self.q})"
 
         try:
             # Get tree embeddings
@@ -999,30 +1094,38 @@ class HyperTreeNetAR:
             self.network.eval()
 
             if type == "forecast":
-                # Forecast parameters: (n_series, fcst_h, n_params)
+                # Forecast coefficients: (n_series, fcst_h, n_params)
                 n_series_test = len(test_series_ids)
                 with torch.no_grad():
                     params_fcst = (self.network(gbdt_embeds)
                                    .cpu()
                                    .detach()
                                    .numpy()
-                                   .reshape(n_series_test, self.fcst_h, self.p))
+                                   .reshape(n_series_test, self.fcst_h, self.n_params))
 
-                # Reconstruct lags array in the same order as test data
+                # Reconstruct the seed states in the same order as test data
                 lags = np.array([self.fcst_lags[series_id] for series_id in test_series_ids])
+                eps = np.array([self.fcst_eps[series_id] for series_id in test_series_ids])
 
                 # Generate multi-step forecasts
                 forecasts = []
                 for h in range(self.fcst_h):
-                    # Compute next value using AR equation: y_t = φ₁y_{t-1} + φ₂y_{t-2} + ... + φₚy_{t-p}
-                    next_val = np.sum(params_fcst[:, h, :] * lags, axis=1).reshape(-1, 1)
+                    # Compute next value using the ARMA equation:
+                    # y_t = φ₁y_{t-1} + ... + φₚy_{t-p} + θ₁ε_{t-1} + ... + θ_qε_{t-q}
+                    next_val = (
+                        np.sum(params_fcst[:, h, :self.p] * lags, axis=1)
+                        + np.sum(params_fcst[:, h, self.p:] * eps, axis=1)
+                    ).reshape(-1, 1)
                     forecasts.append(next_val)
 
-                    # Update lags for next step by adding new forecast and removing oldest lag
+                    # Update the value lags with the new forecast; future
+                    # innovations are unobserved with expectation zero, so the
+                    # residual state is shifted with zeros (the MA terms die
+                    # out after q steps).
                     lags = np.concatenate([next_val, lags[:, :-1]], axis=1)
+                    eps = np.concatenate([np.zeros((n_series_test, 1)), eps[:, :-1]], axis=1)
 
                 # Create output dataframe based on requested type
-                model_name = f"Hyper-TreeNet-AR({self.p})"
                 out_df = pd.DataFrame({
                     "series_id": test_data["series_id"].to_numpy().flatten(),
                     "date": test_data["date"].to_numpy().flatten(),
@@ -1030,8 +1133,9 @@ class HyperTreeNetAR:
                     "model": model_name,
                 })
 
+                # Append conformal prediction intervals if requested.
                 if level is not None:
-                    point = np.hstack(forecasts)  # (n_series, fcst_h)
+                    point = np.hstack(forecasts)  # (n_series_test, fcst_h)
                     columns = interval_columns(
                         point=point,
                         scores=self._cs_scores,
@@ -1049,23 +1153,24 @@ class HyperTreeNetAR:
                     params_fcst = (self.network(gbdt_embeds)
                                    .cpu()
                                    .detach()
-                                   .numpy()
-                                   )
+                                   .numpy())
 
                 out_df = pd.DataFrame({
                     "series_id": test_data["series_id"].to_numpy().flatten(),
                     "date": test_data["date"].to_numpy().flatten(),
-                    "model": f"Hyper-TreeNet-AR({self.p})",
+                    "model": model_name,
                 })
-                # Add AR parameters to the dataframe
-                for i in range(self.p):
-                    out_df[f"AR({i + 1})"] = params_fcst[:, i].flatten()
+                # Add the AR and MA coefficients to the dataframe
+                for j in range(self.p):
+                    out_df[f"AR({j + 1})"] = params_fcst[:, j].flatten()
+                for i in range(self.q):
+                    out_df[f"MA({i + 1})"] = params_fcst[:, self.p + i].flatten()
 
             elif type == "tree_embeddings":
                 out_df = pd.DataFrame({
                     "series_id": test_data["series_id"].to_numpy().flatten(),
                     "date": test_data["date"].to_numpy().flatten(),
-                    "model": f"Hyper-TreeNet-AR({self.p})",
+                    "model": model_name,
                 })
                 # Add tree embeddings to the dataframe
                 for i in range(self.embedding_dim):

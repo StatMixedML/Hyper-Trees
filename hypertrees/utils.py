@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Optional, Any, Tuple
+from typing import Callable, List, Dict, Optional, Any, Tuple
 import torch
 import torch.nn as nn
 from torch.autograd import grad as autograd
@@ -15,6 +15,30 @@ class TrainingResult:
   validation_metrics: Optional[Dict[str, List[float]]] = None
   best_iteration: Optional[int] = None
   training_time: Optional[float] = None
+
+
+def extract_forecast_lags(history: pd.DataFrame, p: int) -> dict:
+    """Extract the last *p* values per series as the AR forecast seed.
+
+    Parameters
+    ----------
+    history : pd.DataFrame
+        Must contain ``series_id`` and ``value`` columns, ordered by
+        ``(series_id, date)`` with each series in a contiguous block.
+    p : int
+        Number of AR lags.
+
+    Returns
+    -------
+    dict
+        ``{series_id: np.ndarray}`` with each array of length *p* in
+        newest-first order, matching the convention used by ``forecast()``.
+    """
+    tail = history.groupby("series_id", sort=False).tail(p)
+    return {
+        sid: g["value"].to_numpy()[::-1]
+        for sid, g in tail.groupby("series_id", sort=False)
+    }
 
 
 def validate_series_order(data: pd.DataFrame, name: str = "data") -> None:
@@ -62,14 +86,46 @@ def validate_series_order(data: pd.DataFrame, name: str = "data") -> None:
             f"`{name} = {name}.sort_values(['series_id', 'date']).reset_index(drop=True)`."
         )
 
-    # Check 2: within each series, `date` must be strictly increasing.
+    # Check 2: within each series, `date` must be strictly increasing
+    # (monotonic AND free of duplicates -- is_monotonic_increasing alone is
+    # non-strict and would let duplicate dates through).
     for series_id, group in data.groupby("series_id", sort=False):
-        if not pd.to_datetime(group["date"]).is_monotonic_increasing:
+        dates = pd.to_datetime(group["date"])
+        if not (dates.is_monotonic_increasing and dates.is_unique):
             raise ValueError(
                 f"{name}: 'date' is not strictly increasing within series "
-                f"'{series_id}'. Fix with "
-                f"`{name} = {name}.sort_values(['series_id', 'date']).reset_index(drop=True)`."
+                f"'{series_id}' (out-of-order or duplicate dates). Sort with "
+                f"`{name} = {name}.sort_values(['series_id', 'date']).reset_index(drop=True)` "
+                f"and remove or aggregate duplicate dates."
             )
+
+class NoDeepcopyObjective:
+    """Keep a custom LightGBM objective bound to the live model instance.
+
+    ``lgb.train`` deep-copies its ``params`` dict before extracting a callable
+    objective, so a bound method would be cloned together with its whole model
+    instance and boosting would train that hidden copy. This wrapper survives
+    ``deepcopy``/``copy`` by reference, keeping the objective pointed at the
+    original, live model.
+
+    Parameters
+    ----------
+    fn : Callable
+        The objective callable (typically ``self.objective_fn``).
+    """
+
+    def __init__(self, fn: Callable):
+        self._fn = fn
+
+    def __call__(self, *args, **kwargs):
+        return self._fn(*args, **kwargs)
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __copy__(self):
+        return self
+
 
 class CustomLogger:
     def __init__(self):
@@ -251,6 +307,28 @@ class TimeSeriesPreprocessor:
         return preprocessed_df
 
 
+class DatasetReferences(dict):
+    """``id(dataset) -> name`` mapping that also pins the datasets.
+
+    The mapping is keyed by object identity, which is only stable while the
+    datasets stay alive: once a dataset is garbage-collected, CPython can
+    reuse its memory address, and a later object would silently inherit its
+    entry (observed as ``eval_fn`` misclassifying a foreign dataset as
+    "train" instead of warning). Holding strong references means a key hit
+    proves it is that exact, still-alive dataset -- the same pinning argument
+    as HyperTreeETS's init cache. Behaves as a plain dict otherwise.
+
+    Parameters
+    ----------
+    pairs : list of (lgb.Dataset, str)
+        Datasets and their names ("train" / "validation").
+    """
+
+    def __init__(self, pairs):
+        super().__init__({id(ds): name for ds, name in pairs})
+        self._pinned = [ds for ds, _ in pairs]
+
+
 def prepare_datasets(
     full_ts: pd.DataFrame,
     preprocessor: Any,  # TimeSeriesPreprocessor
@@ -347,9 +425,10 @@ def prepare_datasets(
         valid_sets = [dtrain, deval]
         valid_names = ["train", "validation"]
 
-        # Store dataset references with names
-        dataset_references[id(dtrain)] = valid_names[0]
-        dataset_references[id(deval)] = valid_names[1]
+        # Store dataset references with names (pinned so the ids stay valid)
+        dataset_references = DatasetReferences(
+            [(dtrain, valid_names[0]), (deval, valid_names[1])]
+        )
 
         if early_stopping_round is not None:
             callbacks.append(
@@ -372,7 +451,7 @@ def prepare_datasets(
         dtrain = lgb.Dataset(data=features_full, label=target_full.reshape(-1, ), free_raw_data=free_raw_data)
         valid_sets = [dtrain]
         valid_names = ["train"]
-        dataset_references[id(dtrain)] = valid_names[0]
+        dataset_references = DatasetReferences([(dtrain, valid_names[0])])
 
         return valid_sets, valid_names, None, None, lags_train, None, dataset_references
 
@@ -415,7 +494,20 @@ class GaussNewtonHessian:
             self.estimate = self._general
 
     def _compute_loss_curvature(self, fit: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Per-element d^2L/d(y_hat)^2 via autograd."""
+        """Per-element d^2L/d(y_hat)^2 via autograd.
+
+        Parameters
+        ----------
+        fit : torch.Tensor
+            Fitted values.
+        target : torch.Tensor
+            Target values, same shape as ``fit``.
+
+        Returns
+        -------
+        torch.Tensor
+            Detached per-element loss curvature, same shape as ``fit``.
+        """
         fit_leaf = fit.detach().requires_grad_(True)
         loss_local = self.loss_fn(fit_leaf, target.detach())
         grad1 = autograd(loss_local, fit_leaf, create_graph=True)[0]
@@ -429,7 +521,24 @@ class GaussNewtonHessian:
         params: torch.Tensor,
         rng: torch.Generator,
     ) -> torch.Tensor:
-        """Hutchinson diagonal Hessian for MSELoss (constant curvature B = 2/N)."""
+        """Hutchinson diagonal Hessian for MSELoss (constant curvature B = 2/N).
+
+        Parameters
+        ----------
+        fit : torch.Tensor
+            Fitted values (graph-connected to ``params``).
+        target : torch.Tensor
+            Target values (unused for MSE; curvature is constant).
+        params : torch.Tensor
+            Parameters w.r.t. which the Hessian diagonal is estimated.
+        rng : torch.Generator
+            Seeded generator for the Gaussian probe vectors.
+
+        Returns
+        -------
+        torch.Tensor
+            Estimated Hessian diagonal, same shape as ``params``.
+        """
         N = fit.numel()
         hess_sum = torch.zeros_like(params)
         for _ in range(self.n_probes):
@@ -445,7 +554,24 @@ class GaussNewtonHessian:
         params: torch.Tensor,
         rng: torch.Generator,
     ) -> torch.Tensor:
-        """Hutchinson diagonal Hessian for arbitrary twice-differentiable losses."""
+        """Hutchinson diagonal Hessian for arbitrary twice-differentiable losses.
+
+        Parameters
+        ----------
+        fit : torch.Tensor
+            Fitted values (graph-connected to ``params``).
+        target : torch.Tensor
+            Target values, same shape as ``fit``.
+        params : torch.Tensor
+            Parameters w.r.t. which the Hessian diagonal is estimated.
+        rng : torch.Generator
+            Seeded generator for the Gaussian probe vectors.
+
+        Returns
+        -------
+        torch.Tensor
+            Estimated Hessian diagonal, same shape as ``params``.
+        """
         loss_curv = self._compute_loss_curvature(fit, target)
         sqrt_curv = loss_curv.clamp(min=0.0).sqrt()
         hess_sum = torch.zeros_like(params)
@@ -454,3 +580,4 @@ class GaussNewtonHessian:
             Jt_z = autograd((z * sqrt_curv * fit).sum(), params, retain_graph=True)[0]
             hess_sum += Jt_z ** 2
         return hess_sum / self.n_probes
+

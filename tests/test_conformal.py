@@ -1,0 +1,224 @@
+"""Unit tests for the conformal prediction math (model-agnostic)."""
+
+import numpy as np
+import pandas as pd
+import pytest
+from unittest.mock import MagicMock, call
+
+from hypertrees import ForecastIntervals
+from hypertrees.conformal import (
+    interval_columns,
+    rolling_origin_residuals,
+    _align_scores,
+    _distribution_bands,
+    _error_bands,
+)
+
+
+def test_forecast_intervals_validation():
+    with pytest.raises(ValueError):
+        ForecastIntervals(n_windows=1)  # must be >= 2
+    with pytest.raises(ValueError):
+        ForecastIntervals(method="bogus")
+    with pytest.raises(ValueError):
+        ForecastIntervals(step_size=0)
+    with pytest.raises(ValueError):
+        ForecastIntervals(refit="yes")  # must be bool
+
+
+def test_distribution_vs_error_bands_symmetry():
+    rng = np.random.default_rng(0)
+    point = rng.standard_normal((2, 3))
+    scores = np.abs(rng.standard_normal((5, 2, 3)))
+    # error bands are symmetric around the point forecast by construction
+    bands = _error_bands(point, scores, [90])
+    lo, hi = bands[90]
+    np.testing.assert_allclose(hi - point, point - lo)
+    # distribution bands: higher level => wider interval
+    d80 = _distribution_bands(point, scores, [80])[80]
+    d90 = _distribution_bands(point, scores, [90])[90]
+    assert np.all(d90[0] <= d80[0] + 1e-9)  # lower bound wider
+    assert np.all(d90[1] >= d80[1] - 1e-9)  # upper bound wider
+
+
+def test_bands_ignore_nan_scores():
+    """NaN scores (residuals at padded pseudo-observations) are excluded.
+
+    Both band methods must compute quantiles only over the non-NaN windows;
+    series without NaN scores must be unaffected.
+    """
+    rng = np.random.default_rng(0)
+    point = rng.standard_normal((2, 3))
+    scores = np.abs(rng.standard_normal((5, 2, 3)))
+
+    scores_nan = scores.copy()
+    scores_nan[0, 0, :] = np.nan  # series 0: first calibration window is padding
+
+    for fn in (_error_bands, _distribution_bands):
+        lo, hi = fn(point, scores_nan, [90])[90]
+        assert np.isfinite(lo).all() and np.isfinite(hi).all()
+        # series 1 (no NaNs) is unaffected
+        ref_lo, ref_hi = fn(point, scores, [90])[90]
+        np.testing.assert_allclose(lo[1], ref_lo[1])
+        np.testing.assert_allclose(hi[1], ref_hi[1])
+        # series 0 equals the bands computed from the remaining windows only
+        red_lo, red_hi = fn(point[[0]], scores[1:, [0], :], [90])[90]
+        np.testing.assert_allclose(lo[0], red_lo[0])
+        np.testing.assert_allclose(hi[0], red_hi[0])
+
+
+def test_align_scores_reorders_series_axis():
+    """_align_scores should permute the series axis to match target_order."""
+    # scores[:, i, :] == i so we can track where each series lands
+    scores = np.stack([np.full((2, 3), i) for i in range(3)], axis=1)  # (2, 3, 3)
+    out = _align_scores(scores, cal_order=[0, 1, 2], target_order=[2, 0, 1])
+    assert np.all(out[:, 0, :] == 2)
+    assert np.all(out[:, 1, :] == 0)
+    assert np.all(out[:, 2, :] == 1)
+
+
+def test_align_scores_noop_when_orders_match():
+    """_align_scores should return scores unchanged when orders are identical."""
+    scores = np.ones((2, 3, 3))
+    out = _align_scores(scores, cal_order=[0, 1, 2], target_order=[0, 1, 2])
+    assert out is scores
+
+
+def test_align_scores_raises_on_missing_series():
+    """_align_scores should raise if a target series wasn't calibrated."""
+    scores = np.ones((2, 2, 3))
+    with pytest.raises(ValueError, match="not seen during conformal calibration"):
+        _align_scores(scores, cal_order=[0, 1], target_order=[0, 99])
+
+
+def test_interval_columns_rejects_bad_level():
+    """interval_columns should reject levels outside (0, 100)."""
+    with pytest.raises(ValueError, match=r"level values must be in \(0, 100\)"):
+        interval_columns(
+            point=np.zeros((1, 2)),
+            scores=np.ones((3, 1, 2)),
+            levels=[100],
+            method="conformal_error",
+            model_name="M",
+            cal_order=[0],
+            target_order=[0],
+        )
+
+
+def test_interval_columns_rejects_bad_method():
+    """interval_columns should reject an unknown method."""
+    with pytest.raises(ValueError, match="method must be one of"):
+        interval_columns(
+            point=np.zeros((1, 2)),
+            scores=np.ones((3, 1, 2)),
+            levels=[90],
+            method="bogus",
+            model_name="M",
+            cal_order=[0],
+            target_order=[0],
+        )
+
+
+def test_interval_columns_naming_and_ordering():
+    point = np.zeros((2, 3))
+    scores = np.ones((4, 2, 3))
+    cols = interval_columns(
+        point=point,
+        scores=scores,
+        levels=[80, 90],
+        method="conformal_error",
+        model_name="M",
+        cal_order=[0, 1],
+        target_order=[0, 1],
+    )
+    assert list(cols.keys()) == ["M-lo-90", "M-lo-80", "M-hi-80", "M-hi-90"]
+    for v in cols.values():
+        assert v.shape == (2 * 3,)
+
+
+def test_refit_false_calls_set_forecast_origin():
+    """rolling_origin_residuals with refit=False must re-anchor per window."""
+    n_series, T, fcst_h = 2, 20, 3
+    n_windows, step_size = 3, 1
+    dates = pd.date_range("2020-01-01", periods=T, freq="MS")
+    train_data = pd.concat([
+        pd.DataFrame({
+            "series_id": sid, "date": dates,
+            "value": np.arange(T, dtype=float) + sid * 100,
+        })
+        for sid in range(n_series)
+    ], ignore_index=True)
+
+    # Build a mock model that returns deterministic forecasts
+    mock_model = MagicMock()
+    mock_model.set_forecast_origin = MagicMock()
+
+    def fake_forecast(test_data, type="forecast"):
+        return pd.DataFrame({
+            "series_id": test_data["series_id"].values,
+            "date": test_data["date"].values,
+            "fcst": test_data["value"].values + 0.5,
+            "model": "mock",
+        })
+
+    mock_model.forecast = MagicMock(side_effect=fake_forecast)
+    mock_model.train = MagicMock()
+
+    pi = ForecastIntervals(n_windows=n_windows, step_size=step_size, refit=False)
+    scores, series_order = rolling_origin_residuals(
+        model_factory=lambda: mock_model,
+        train_data=train_data,
+        fcst_h=fcst_h,
+        forecast_intervals=pi,
+        train_kwargs={},
+    )
+
+    # train() called once (oldest window)
+    assert mock_model.train.call_count == 1
+    # set_forecast_origin called once per window
+    assert mock_model.set_forecast_origin.call_count == n_windows
+    # scores shape is correct
+    assert scores.shape == (n_windows, n_series, fcst_h)
+    # residuals should all be 0.5 (our fake_forecast adds 0.5)
+    np.testing.assert_allclose(scores, 0.5)
+
+
+def test_rolling_origin_residuals_masks_padded_rows():
+    """Residuals at padded rows (mask == 0) must be NaN in the scores."""
+    T, fcst_h = 12, 3
+    dates = pd.date_range("2020-01-01", periods=T, freq="MS")
+    train_data = pd.DataFrame({
+        "series_id": 0,
+        "date": dates,
+        "value": np.arange(T, dtype=float),
+        "mask": [1] * (T - 2) + [0, 0],  # last two rows are padding
+    })
+
+    mock_model = MagicMock()
+
+    def fake_forecast(test_data, type="forecast"):
+        return pd.DataFrame({
+            "series_id": test_data["series_id"].values,
+            "date": test_data["date"].values,
+            "fcst": test_data["value"].values + 0.5,
+            "model": "mock",
+        })
+
+    mock_model.forecast = MagicMock(side_effect=fake_forecast)
+    mock_model.train = MagicMock()
+
+    pi = ForecastIntervals(n_windows=2, step_size=1, refit=True)
+    scores, _ = rolling_origin_residuals(
+        model_factory=lambda: mock_model,
+        train_data=train_data,
+        fcst_h=fcst_h,
+        forecast_intervals=pi,
+        train_kwargs={},
+    )
+
+    # Window 0 tests the last 3 rows: positions 1 and 2 are padding -> NaN
+    np.testing.assert_allclose(scores[0, 0, 0], 0.5)
+    assert np.isnan(scores[0, 0, 1]) and np.isnan(scores[0, 0, 2])
+    # Window 1 tests rows T-4..T-2: only the last is padding -> NaN
+    np.testing.assert_allclose(scores[1, 0, :2], 0.5)
+    assert np.isnan(scores[1, 0, 2])

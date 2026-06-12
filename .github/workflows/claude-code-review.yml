@@ -37,6 +37,11 @@ jobs:
             - New or changed logic that lacks corresponding test coverage
 
             Do NOT flag minor style or formatting issues that a linter or formatter would catch.
+
+            Ignore Jupyter notebooks entirely: do NOT read, review, or comment on any
+            `*.ipynb` files. When inspecting the diff, exclude them, e.g.
+            `gh pr diff ${{ github.event.pull_request.number }} -- ':!*.ipynb'`.
+
             If no substantive issues are found, post a short approval comment.
 
             The PR branch is already checked out.
@@ -45,6 +50,6 @@ jobs:
             Only post GitHub comments, do not submit review text as messages.
 
           claude_args: |
-            --model claude-sonnet-4-6
-            --max-turns 10
+            --model claude-opus-4-6
+            --max-turns 20
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"

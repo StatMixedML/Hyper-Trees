@@ -41,6 +41,6 @@ jobs:
             actions: read
 
           claude_args: |
-            --model claude-sonnet-4-6
-            --max-turns 10
-            --allowedTools "Edit,Read,Write,Bash(uv run pytest:*),Bash(uv run ruff check:*),Bash(gh:*),Bash(git:*)"
+            --model claude-opus-4-6
+            --max-turns 20
+            --allowedTools "Edit,Read,Write,Bash(python -m pip install:*),Bash(pytest:*),Bash(flake8:*),Bash(gh:*),Bash(git:*)"

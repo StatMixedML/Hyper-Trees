@@ -1,0 +1,43 @@
+Hyper-Trees
+Copyright 2026 Alexander März
+
+Licensed under the Apache License, Version 2.0, with the Commons Clause License
+Condition v1.0. See the LICENSE file for the full terms.
+
+------------------------------------------------------------------------------
+Third-party attributions
+------------------------------------------------------------------------------
+
+This product includes software adapted from the Nixtla open-source forecasting
+libraries, each licensed under the Apache License, Version 2.0:
+
+  - statsforecast    https://github.com/Nixtla/statsforecast
+  - mlforecast       https://github.com/Nixtla/mlforecast
+  - neuralforecast   https://github.com/Nixtla/neuralforecast
+
+The following components are adapted from these libraries and have been
+modified from the originals:
+
+  - Conformal prediction intervals (hypertrees/conformal.py): the
+    rolling-origin calibration, the two interval-construction methods
+    ("conformal_distribution" and "conformal_error"), the per-horizon-step
+    quantile logic, and the "<model>-lo-<level>" / "<model>-hi-<level>"
+    output column naming convention follow Nixtla's design.
+
+  - Exponential smoothing state initialization
+    (hypertrees/models/HyperTreeETS.py): the classical and additive
+    seasonal/level/trend initialization (centered 2 x m moving-average
+    detrending, per-slot seasonal indices, the OLS level/trend seed, and the
+    initial-seasonal clipping) follows the statsforecast / R forecast::ets
+    heuristic.
+
+  - TSB intermittent-demand method (hypertrees/models/HyperTreeTSB.py): the
+    probability/size smoothing recursion and the state initialization follow
+    the statsforecast TSB implementation.
+
+  - Time series preprocessing (hypertrees/utils.py): the frequency-alias
+    conversion and the lag-column ordering follow the mlforecast conventions.
+
+A copy of the Apache License, Version 2.0, is available at:
+
+    http://www.apache.org/licenses/LICENSE-2.0

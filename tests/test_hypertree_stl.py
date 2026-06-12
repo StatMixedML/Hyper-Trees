@@ -29,7 +29,7 @@ class TestHyperTreeSTLInitialization:
         assert model.is_trained is False
 
     def test_custom_initialization(self):
-        loss_fn = nn.L1Loss()
+        loss_fn = nn.HuberLoss()
         model = HyperTreeSTL(period=24, num_seasonal_components=2, freq="D", fcst_h=6, loss_fn=loss_fn)
         assert model.period == 24
         assert model.num_seasonal_components == 2
@@ -37,8 +37,13 @@ class TestHyperTreeSTLInitialization:
         assert model.freq == "D"
         assert model.fcst_h == 6
         assert model.loss_fn is loss_fn
-        assert model.loss_name == "L1Loss"
+        assert model.loss_name == "HuberLoss"
         assert model.forward_type == "default"
+
+    def test_l1_loss_rejected(self):
+        """nn.L1Loss is rejected: zero curvature yields all-zero Hessians."""
+        with pytest.raises(ValueError, match="L1Loss is not supported"):
+            HyperTreeSTL(loss_fn=nn.L1Loss())
 
     def test_invalid_period(self):
         with pytest.raises(ValueError, match="Period must be a positive integer"):
@@ -186,6 +191,9 @@ class TestHyperTreeSTLTraining:
     @patch("hypertrees.models.HyperTreeSTL.TimeSeriesPreprocessor")
     def test_successful_training(self, mock_preprocessor, mock_prepare_datasets, mock_lgb_train, sample_train_data):
         model = HyperTreeSTL(period=12, num_seasonal_components=1)
+        # The post-training seasonal-offset anchoring predicts with the model;
+        # stub it out since lgb.train is mocked (no real booster to predict with).
+        model._compute_seasonal_offset = Mock(return_value=0.0)
 
         # Mock preprocessor to return the same data and expose features incl. time_idx
         mock_pre = Mock()
@@ -218,7 +226,7 @@ class TestHyperTreeSTLTraining:
         assert isinstance(result, TrainingResult)
         assert result.train_metrics == {"loss": []}
         assert result.validation_metrics is None
-        assert result.best_iteration == 10  # best_iteration-1
+        assert result.best_iteration == 11  # model.best_iteration when > 0
         assert result.training_time is not None
 
 
@@ -300,7 +308,7 @@ class TestHyperTreeSTLForecasting:
         assert isinstance(result, pd.DataFrame)
         assert set(["series_id", "date", "fcst", "model"]).issubset(result.columns)
         assert len(result) == len(sample_test_data)
-        assert result["model"].iloc[0] == f"Hyper-Tree-STL(period={trained_model.period})"
+        assert result["model"].iloc[0] == f"Hyper-Tree-STL({trained_model.period})"
 
     def test_forecast_components_output(self, trained_model, sample_test_data):
         result = trained_model.forecast(test_data=sample_test_data, type="components")
@@ -322,7 +330,7 @@ class TestHyperTreeSTLForecasting:
         }
         assert expected_cols.issubset(result.columns)
         assert len(result) == len(sample_test_data)
-        assert result["model"].iloc[0] == f"Hyper-Tree-STL(period={trained_model.period})"
+        assert result["model"].iloc[0] == f"Hyper-Tree-STL({trained_model.period})"
         # Basic sanity: parameter columns contain numeric values and no NaNs
         params_df = result[[
             "trend_intercept",
@@ -497,6 +505,38 @@ class TestHyperTreeSTLForwardMethods:
 
         assert trend.shape == (n_samples, n_series)
         assert seasonality.shape == (n_samples, n_series)
+
+    def test_forward_default_window_param_receives_gradient(self):
+        """The learnable smoothing-window parameter must receive gradients.
+
+        A hard ``int(median(...).item())`` window severed the autograd graph,
+        giving the parameter zero gradient and Hessian -- LightGBM then grew
+        zero-valued trees and the window never learned.
+        """
+        torch.manual_seed(0)
+        model = HyperTreeSTL(period=12, num_seasonal_components=1, type="default")
+        T = 48
+        params = torch.nn.Parameter(torch.randn(T, 1, model.n_params))
+        time_idx = torch.arange(1, T + 1, dtype=torch.float32).reshape(T, 1)
+
+        trend, seasonality = model._forward_default(params, time_idx)
+        loss = ((trend + seasonality) ** 2).mean()
+        loss.backward()
+
+        assert params.grad is not None
+        assert params.grad[:, :, 2].abs().max() > 0
+
+    def test_forward_default_short_series_no_crash(self):
+        """Reflect padding must not exceed the input length for short horizons."""
+        model = HyperTreeSTL(period=12, num_seasonal_components=1, type="default")
+        for T in [1, 2, 4, 6]:
+            params = torch.randn(T, 1, model.n_params)
+            time_idx = torch.arange(1, T + 1, dtype=torch.float32).reshape(T, 1)
+            trend, seasonality = model._forward_default(params, time_idx)
+            assert trend.shape == (T, 1)
+            assert seasonality.shape == (T, 1)
+            assert torch.isfinite(trend).all()
+            assert torch.isfinite(seasonality).all()
 
     def test_forward_method_selection(self):
         """Test that the correct forward method is selected based on type."""
