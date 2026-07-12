@@ -568,6 +568,21 @@ class TestHyperTreeSTLCoreMethods:
         assert params.requires_grad is True
         assert loss.requires_grad is True
 
+    @pytest.mark.parametrize("n_samples", [1, 2])
+    def test_get_params_loss_short_horizon_smoothing_is_finite(self, n_samples):
+        model = HyperTreeSTL(period=12, num_seasonal_components=2, fcst_h=n_samples, type="default")
+        n_params = model.n_params
+        predt = np.random.randn(n_samples * n_params)
+        target = torch.randn(n_samples, 1)
+        model.n_series = 1
+        time_idx = torch.arange(1, n_samples + 1, dtype=torch.float32).reshape(-1, 1)
+
+        params, loss = model.get_params_loss(predt, target, time_idx, requires_grad=True)
+
+        assert params.requires_grad is True
+        assert loss.requires_grad is True
+        assert torch.isfinite(loss)
+
     def test_calculate_gradients_and_hessians(self):
         model = HyperTreeSTL(period=6, type="default")
         n_params = model.n_params  # Should be 5 for default type

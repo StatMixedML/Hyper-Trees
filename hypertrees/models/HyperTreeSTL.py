@@ -290,10 +290,13 @@ class HyperTreeSTL:
 
         # Calculate losses for trend and add smoothing penalties
         loss_trend = self.loss_fn(trend, y_trend)
-        smooth_d1 = torch.nanmean(torch.diff(trend, dim=0, n=1) ** 2, dim=0)
-        smooth_d2 = torch.nanmean(torch.diff(trend, dim=0, n=2) ** 2, dim=0)
-        smooth_penalty = torch.nanmean(torch.cat([smooth_d1, smooth_d2], dim=0))
-        loss_trend += smooth_penalty
+        smooth_terms = []
+        if trend.shape[0] >= 2:
+            smooth_terms.append(torch.nanmean(torch.diff(trend, dim=0, n=1) ** 2, dim=0))
+        if trend.shape[0] >= 3:
+            smooth_terms.append(torch.nanmean(torch.diff(trend, dim=0, n=2) ** 2, dim=0))
+        if smooth_terms:
+            loss_trend += torch.nanmean(torch.cat(smooth_terms, dim=0))
 
         # Loss for seasonal component
         loss_seasonality = self.loss_fn(seasonality, y_seasonality)
