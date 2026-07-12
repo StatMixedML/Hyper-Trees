@@ -498,6 +498,36 @@ class TestHyperTreeSTLForwardMethods:
         assert trend.shape == (n_samples, n_series)
         assert seasonality.shape == (n_samples, n_series)
 
+    def test_forward_default_short_horizon(self):
+        """Default STL smoothing should support short forecast horizons."""
+        model = HyperTreeSTL(period=12, num_seasonal_components=2, fcst_h=3, type="default")
+        n_samples = 3
+        n_series = 1
+        n_params = model.n_params
+
+        params = torch.randn(n_samples, n_series, n_params)
+        time_idx = torch.arange(1, n_samples + 1, dtype=torch.float32).reshape(-1, n_series)
+
+        trend, seasonality = model._forward_default(params, time_idx)
+
+        assert trend.shape == (n_samples, n_series)
+        assert seasonality.shape == (n_samples, n_series)
+
+    def test_forward_default_single_step_horizon(self):
+        """Default STL smoothing should bypass padding for a one-step horizon."""
+        model = HyperTreeSTL(period=12, num_seasonal_components=2, fcst_h=1, type="default")
+        n_samples = 1
+        n_series = 1
+        n_params = model.n_params
+
+        params = torch.randn(n_samples, n_series, n_params)
+        time_idx = torch.ones(n_samples, n_series, dtype=torch.float32)
+
+        trend, seasonality = model._forward_default(params, time_idx)
+
+        assert trend.shape == (n_samples, n_series)
+        assert seasonality.shape == (n_samples, n_series)
+
     def test_forward_method_selection(self):
         """Test that the correct forward method is selected based on type."""
         model_paper = HyperTreeSTL(type="paper")

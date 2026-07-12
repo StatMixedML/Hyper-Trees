@@ -429,21 +429,27 @@ class HyperTreeSTL:
         slope = params[:, :, 1]
         trend_raw = intercept + slope * time_idx
 
-        # Map logit -> odd window size W in [3, max_w]
-        max_w = min(2 * m + 1, 101)
-        w_logit = params[:, :, 2]
-        w_float = (max_w - 3) * torch.sigmoid(w_logit) + 3.0
-        W = int(torch.median(torch.round(w_float)).clamp(3, max_w).item())
-        if W % 2 == 0:
-            W += 1
+        # Map logit -> odd window size W in [3, max_w]. Reflect padding requires
+        # pad < T, so cap the smoothing window by the current sequence length.
+        # This matters during short-horizon forecasting, e.g. fcst_h=3.
+        if T <= 1:
+            trend = trend_raw
+        else:
+            max_w = min(2 * m + 1, 101, 2 * T - 1)
+            min_w = 3
+            w_logit = params[:, :, 2]
+            w_float = (max_w - min_w) * torch.sigmoid(w_logit) + float(min_w)
+            W = int(torch.median(torch.round(w_float)).clamp(min_w, max_w).item())
+            if W % 2 == 0:
+                W += 1
 
-        # Grouped conv expects channels divisible by groups.
-        # Put series in the *channel* dimension: input (1, N, T), weight (N, 1, W), groups=N.
-        k = torch.ones((N, 1, W), dtype=dtype) / W  # (N,1,W)
-        xin = trend_raw.T.contiguous().unsqueeze(0)  # (1,N,T)
-        pad = W // 2
-        xpad = torch.nn.functional.pad(xin, (pad, pad), mode="reflect")  # (1,N,T+2p)
-        trend = torch.nn.functional.conv1d(xpad, k, groups=N).squeeze(0).T  # (T,N)
+            # Grouped conv expects channels divisible by groups.
+            # Put series in the *channel* dimension: input (1, N, T), weight (N, 1, W), groups=N.
+            k = torch.ones((N, 1, W), dtype=dtype) / W  # (N,1,W)
+            xin = trend_raw.T.contiguous().unsqueeze(0)  # (1,N,T)
+            pad = W // 2
+            xpad = torch.nn.functional.pad(xin, (pad, pad), mode="reflect")  # (1,N,T+2p)
+            trend = torch.nn.functional.conv1d(xpad, k, groups=N).squeeze(0).T  # (T,N)
 
         # Seasonality: Fourier with per-cycle zero-mean centering
         H = (self.n_params - 3) // 2
@@ -463,8 +469,10 @@ class HyperTreeSTL:
         C = (T + m - 1) // m
         pad_T = C * m - T
         if pad_T > 0:
-            tail = torch.flip(seasonality[-min(T, pad_T):, :], dims=[0])
-            S_ext = torch.cat([seasonality, tail[:pad_T]], dim=0)  # (C*m,N)
+            tail = torch.flip(seasonality, dims=[0])
+            repeats = (pad_T + T - 1) // T
+            tail = tail.repeat((repeats, 1))[:pad_T]
+            S_ext = torch.cat([seasonality, tail], dim=0)  # (C*m,N)
         else:
             S_ext = seasonality
 
