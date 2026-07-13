@@ -1,5 +1,7 @@
 """Tests for the Hyper-TreeNet-ARMA model (GBDT encoder + MLP decoder)."""
 
+from unittest.mock import Mock, patch
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -276,3 +278,123 @@ class TestNetARMAForecastValidation:
         model, _, test = _trained()
         with pytest.raises(RuntimeError, match="was not calibrated"):
             model.forecast(test_data=test, level=[80])
+
+    def test_missing_column_features_and_level_values(self):
+        model, _, test = _trained(
+            forecast_intervals=ForecastIntervals(n_windows=2, refit=False),
+        )
+        with pytest.raises(ValueError, match="Required column 'date'"):
+            model.forecast(test_data=test.drop(columns="date"))
+        with pytest.raises(ValueError, match="Missing features"):
+            model.forecast(test_data=test.drop(columns="month"))
+        with pytest.raises(ValueError, match="only supported with type='forecast'"):
+            model.forecast(test_data=test, type="parameters", level=[80])
+        with pytest.raises(ValueError, match="non-empty list"):
+            model.forecast(test_data=test, level=80)
+        with pytest.raises(ValueError, match=r"integers in \(0, 100\)"):
+            model.forecast(test_data=test, level=[150])
+
+    def test_internal_error_wrapped(self):
+        model, _, test = _trained()
+        # Corrupt the value seed so the recursion fails inside the try block.
+        model.fcst_lags = {sid: np.zeros(P + 3) for sid in model.fcst_lags}
+        with pytest.raises(RuntimeError, match="Forecasting not successful"):
+            model.forecast(test_data=test)
+
+
+class TestNetARMAArgumentValidation:
+    @pytest.mark.parametrize("kwargs,match", [
+        ({"fcst_h": 0}, "'fcst_h' must be a positive integer"),
+        ({"freq": 123}, "freq must be a string"),
+        ({"loss_fn": "mse"}, "must be a PyTorch loss function"),
+        ({"loss_fn": nn.MSELoss(reduction="none")}, "scalar reduction"),
+        ({"n_hessian_probes": 0}, "n_hessian_probes must be a positive integer"),
+    ])
+    def test_constructor_validation(self, kwargs, match):
+        with pytest.raises((ValueError, TypeError), match=match):
+            make_model(**kwargs)
+
+    @pytest.mark.parametrize("overrides,match", [
+        ({"train_data": None}, "train_data must be provided"),
+        ({"lgb_params": None}, "lgb_params must be provided"),
+        ({"train_data": "df"}, "train_data must be a pandas DataFrame"),
+        ({"lgb_params": "params"}, "lgb_params must be a dictionary"),
+        ({"num_iterations": 0}, "num_iterations must be a positive integer"),
+        ({"seed": 1.5}, "seed must be an integer"),
+        ({"verbose": "loud"}, "verbose must be an integer"),
+        ({"validation": True, "early_stopping_round": 0},
+         "early_stopping_round must be a positive integer"),
+        ({"validation": "yes"}, "validation must be a boolean"),
+        ({"deterministic": "yes"}, "deterministic must be a boolean"),
+        ({"forecast_intervals": "conformal"}, "must be a ForecastIntervals instance"),
+        ({"early_stopping_round": 5}, "can only be used when validation is True"),
+        ({"validation": True}, "early_stopping_round must be provided"),
+        ({"network_params": "net"}, "network_params must be a dictionary"),
+        ({"network_params": {k: v for k, v in NETWORK_PARAMS.items() if k != "rp_embed_dim"}},
+         r"missing required keys: \['rp_embed_dim'\]"),
+    ])
+    def test_train_argument_validation(self, overrides, match):
+        train, _ = make_panel()
+        kwargs = dict(
+            lgb_params=LGB_PARAMS, network_params=NETWORK_PARAMS,
+            num_iterations=5, train_data=train,
+        )
+        kwargs.update(overrides)
+        with pytest.raises((ValueError, TypeError), match=match):
+            make_model().train(**kwargs)
+
+    def test_missing_required_column_raises(self):
+        train, _ = make_panel()
+        with pytest.raises(ValueError, match="Required column 'value'"):
+            make_model().train(
+                lgb_params=LGB_PARAMS, network_params=NETWORK_PARAMS,
+                num_iterations=5, train_data=train.drop(columns="value"),
+            )
+
+    def test_set_forecast_origin_guards(self):
+        train, _ = make_panel()
+        with pytest.raises(RuntimeError, match="requires a trained model"):
+            make_model().set_forecast_origin(train)
+
+        model, train, _ = _trained()
+        short = train.groupby("series_id", sort=False).head(3).reset_index(drop=True)
+        with pytest.raises(ValueError, match="at least"):
+            model.set_forecast_origin(short)
+
+    def test_training_failure_wrapped(self):
+        train, _ = make_panel()
+        model = make_model()
+        # The stage-1 AR trains via its own module; failing the stage-2
+        # lgb.train must surface as the wrapped RuntimeError.
+        with patch("hypertrees.models.HyperTreeNetARMA.lgb.train", side_effect=Exception("boom")):
+            with pytest.raises(RuntimeError, match="Training failed"):
+                model.train(
+                    lgb_params=LGB_PARAMS, network_params=NETWORK_PARAMS,
+                    num_iterations=3, train_data=train,
+                )
+
+    def test_eval_fn_unknown_dataset_warns(self):
+        model, _, _ = _trained(num_iterations=3)
+        n_rows = model.design_train.shape[0]
+        mock_eval = Mock()
+        mock_eval.get_label.return_value = np.zeros(n_rows)
+        with pytest.warns(UserWarning, match="Unknown dataset in metric_fn"):
+            name, value, higher_better = model.eval_fn(
+                np.zeros(n_rows * model.embedding_dim), mock_eval
+            )
+        assert name == "MSELoss"
+        assert higher_better is False
+
+
+def test_category_dtype_features_roundtrip(assert_forecast_preserves_dataframe):
+    """Issue #11 regression: category-dtype features must reach LightGBM as a
+    pandas DataFrame at forecast time."""
+    train, test = make_panel()
+    for df in (train, test):
+        df["series_num"] = df["series_num"].astype("category")
+    model = make_model()
+    model.train(
+        lgb_params=LGB_PARAMS, network_params=NETWORK_PARAMS,
+        num_iterations=10, train_data=train,
+    )
+    assert_forecast_preserves_dataframe(model, test)

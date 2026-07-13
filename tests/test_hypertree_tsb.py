@@ -446,3 +446,17 @@ class TestTSBRecursiveValidationMetric:
         # Only the two valid rows count (3 and 0); the padded 999 is masked out.
         expected = ((point - 3.0) ** 2 + (point - 0.0) ** 2 + 0.0) / 3.0
         assert abs(loss_val - expected) < 1e-5
+
+
+def test_category_dtype_features_roundtrip(assert_forecast_preserves_dataframe):
+    """Issue #11 regression: category-dtype features must reach LightGBM as a
+    pandas DataFrame at forecast time."""
+    train, test = make_panel()
+    for df in (train, test):
+        df["series_num"] = df["series_num"].astype("category")
+    model = HyperTreeTSB(freq="W", fcst_h=FCST_H)
+    model.train(lgb_params=LGB_PARAMS, num_iterations=10, train_data=train)
+    # The flat TSB point forecast is computed from states stored at train
+    # time without touching the Booster; type="parameters" is the path
+    # where test features reach LightGBM at forecast time.
+    assert_forecast_preserves_dataframe(model, test, type="parameters")

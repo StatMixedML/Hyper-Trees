@@ -1403,3 +1403,36 @@ class TestHyperTreeARAnalyticHessian:
         out = model.forecast(test_data=test)
         assert len(out) == 2
         assert np.isfinite(out["fcst"]).all()
+
+
+def test_category_dtype_features_roundtrip(assert_forecast_preserves_dataframe):
+    """Issue #11 regression: category-dtype features must reach LightGBM as a
+    pandas DataFrame at forecast time."""
+    fcst_h = 3
+    dates = pd.date_range("2020-01-01", periods=60, freq="MS")
+    df = pd.concat(
+        [
+            pd.DataFrame({
+                "series_id": f"s{i}",
+                "date": dates,
+                "value": np.random.RandomState(i).randn(60).cumsum() + 100,
+                "month": dates.month,
+                "item": i,
+            })
+            for i in range(3)
+        ],
+        ignore_index=True,
+    )
+    tail_idx = df.groupby("series_id", sort=False).tail(fcst_h).index
+    test = df.loc[tail_idx].reset_index(drop=True)
+    train = df.drop(tail_idx).reset_index(drop=True)
+    for d in (train, test):
+        d["item"] = d["item"].astype("category")
+
+    model = HyperTreeAR(p=3, freq="M", fcst_h=fcst_h)
+    model.train(
+        lgb_params={"learning_rate": 0.1, "min_data_in_leaf": 5},
+        num_iterations=10,
+        train_data=train,
+    )
+    assert_forecast_preserves_dataframe(model, test)

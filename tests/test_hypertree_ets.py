@@ -1421,3 +1421,14 @@ class TestHyperTreeETSRecursiveValidationMetric:
         model._roll_forecast(torch.tensor([100.0]), torch.tensor([1.0]),
                              seas, params, idxs)
         assert torch.allclose(seas, seas_before)
+
+
+def test_category_dtype_features_roundtrip(assert_forecast_preserves_dataframe):
+    """Issue #11 regression: category-dtype features must reach LightGBM as a
+    pandas DataFrame at forecast time."""
+    train, test = make_additive_panel()
+    for df in (train, test):
+        df["series_num"] = df["series_num"].astype("category")
+    model = make_additive_model()
+    model.train(lgb_params=LGB_PARAMS_A, num_iterations=10, train_data=train)
+    assert_forecast_preserves_dataframe(model, test)

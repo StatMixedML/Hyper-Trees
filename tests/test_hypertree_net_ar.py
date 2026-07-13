@@ -1454,3 +1454,43 @@ class TestHyperTreeNetARConformal:
                      num_iterations=20, train_data=train)
         with pytest.raises(RuntimeError, match="not calibrated"):
             model.forecast(test_data=test, level=[90])
+
+
+class TestForecastPreservesCategoricalDtypes:
+    """Regression tests for GitHub issue #11: forecast() must pass a pandas
+    DataFrame (not ``.values``) to Booster.predict, so ``category`` dtype
+    features keep their categorical encoding at prediction time."""
+
+    FCST_H = 4
+    N_SERIES = 2
+    N_OBS = 60
+    LGB_PARAMS = {"learning_rate": 0.1, "num_leaves": 15, "min_data_in_leaf": 1, "min_data_in_bin": 1}
+    NETWORK_PARAMS = {
+        "learning_rate": 1e-3, "embedding_dimension": 1, "hidden_dim": 32,
+        "dropout": 0.0, "use_random_projection": False, "rp_embed_dim": None,
+    }
+
+    def _make_split(self):
+        rng = np.random.default_rng(42)
+        dates = pd.date_range("2015-01-01", periods=self.N_OBS, freq="MS")
+        frames = []
+        for sid in range(self.N_SERIES):
+            frames.append(pd.DataFrame({
+                "series_id": sid, "date": dates,
+                "value": rng.standard_normal(self.N_OBS).cumsum() + 100,
+                "month": dates.month,
+                "series_num": sid,
+            }))
+        df = pd.concat(frames, ignore_index=True)
+        df["series_num"] = df["series_num"].astype("category")
+        test = df.groupby("series_id", sort=False).tail(self.FCST_H).reset_index(drop=True)
+        train = df.drop(df.groupby("series_id", sort=False).tail(self.FCST_H).index).reset_index(drop=True)
+
+        return train, test
+
+    def test_predict_receives_dataframe_with_category_dtype(self, assert_forecast_preserves_dataframe):
+        train, test = self._make_split()
+        model = HyperTreeNetAR(p=2, freq="M", fcst_h=self.FCST_H)
+        model.train(lgb_params=self.LGB_PARAMS, network_params=self.NETWORK_PARAMS,
+                    num_iterations=10, train_data=train)
+        assert_forecast_preserves_dataframe(model, test)
