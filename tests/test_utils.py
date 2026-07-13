@@ -189,6 +189,33 @@ class TestTimeSeriesPreprocessor:
         # Features detected and stored on the processor
         assert sorted(processor.features) == ['feature1', 'feature2']
 
+    def test_preprocess_rejects_reserved_lag_feature_names(self):
+        """Feature columns named lag<number> are reserved for the generated
+        AR lags: a name inside the lag range would be silently overwritten
+        (and the surviving column order permuted), one outside the range
+        would be mis-collected into the lag tensor by extract()."""
+        processor = TimeSeriesPreprocessor(freq='D', lags=[1, 2, 3])
+
+        for reserved_name in ['lag2', 'lag5']:
+            input_df = pd.DataFrame({
+                'series_id': [1] * 5,
+                'date': pd.date_range('2020-01-01', periods=5, freq='D'),
+                'value': [10, 12, 14, 16, 18],
+                reserved_name: [100] * 5,
+            })
+            with pytest.raises(ValueError, match="reserved"):
+                processor.preprocess(input_df)
+
+        # Names that merely start with 'lag' but are not lag<number> are fine
+        input_df = pd.DataFrame({
+            'series_id': [1] * 5,
+            'date': pd.date_range('2020-01-01', periods=5, freq='D'),
+            'value': [10, 12, 14, 16, 18],
+            'lagged_promo': [100] * 5,
+        })
+        result = processor.preprocess(input_df)
+        assert 'lagged_promo' in result.columns
+
     def test_extract_features(self):
         """Test feature extraction from a preprocessed DataFrame."""
         processor = TimeSeriesPreprocessor(freq='M', lags=[1, 2])

@@ -229,6 +229,19 @@ class TimeSeriesPreprocessor:
         # Identify feature columns
         self.features = [col for col in df.columns if col not in required_columns]
 
+        # Names matching lag<number> are reserved: preprocess() writes the
+        # generated lag columns in place (silently overwriting a same-named
+        # feature) and extract() collects every such column into the lag
+        # tensor.
+        reserved = [c for c in self.features if c.startswith("lag") and c[3:].isdigit()]
+        if reserved:
+            raise ValueError(
+                f"Feature column name(s) {reserved} are reserved: the preprocessor "
+                f"generates autoregressive lag columns 'lag1', 'lag2', ... and would "
+                f"overwrite or mis-detect same-named features. Please rename the "
+                f"column(s)."
+            )
+
         # Ensure contiguous ordering per series for correct shift() behavior
         result_df = df[["series_id", "date", "value"] + self.features].sort_values(
             ["series_id", "date"]
