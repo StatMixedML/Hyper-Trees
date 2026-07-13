@@ -1432,3 +1432,61 @@ def test_category_dtype_features_roundtrip(assert_forecast_preserves_dataframe):
     model = make_additive_model()
     model.train(lgb_params=LGB_PARAMS_A, num_iterations=10, train_data=train)
     assert_forecast_preserves_dataframe(model, test)
+
+
+class TestTriplePositivityValidation:
+    """ets_type='triple' fits multiplicative seasonality and must reject
+    non-positive training values instead of silently fitting meaningless
+    ratio-based components. Masked padding rows (mask == 0) are exempt."""
+
+    def _make_model(self):
+        return HyperTreeETS(
+            ets_type="triple", seasonality_feature="month",
+            season_length=M_A, freq="M", fcst_h=FCST_H_A,
+        )
+
+    @pytest.mark.parametrize("bad_value", [0.0, -5.0])
+    def test_non_positive_values_rejected(self, bad_value):
+        train, _ = make_additive_panel()
+        train.loc[10, "value"] = bad_value
+        with pytest.raises(ValueError, match="strictly positive"):
+            self._make_model().train(
+                lgb_params=LGB_PARAMS_A, num_iterations=5, train_data=train
+            )
+
+    def test_masked_padding_zeros_are_exempt(self):
+        """Back-padded pseudo-observations are 0 by construction and must not
+        trigger the positivity check when flagged by the mask column."""
+        train, _ = make_additive_panel()
+        train["mask"] = 1
+        pad_dates = pd.date_range(
+            train["date"].max() + pd.DateOffset(months=1), periods=3, freq="MS"
+        )
+        pads = []
+        for sid, group in train.groupby("series_id", sort=False):
+            pads.append(pd.DataFrame({
+                "series_id": sid,
+                "date": pad_dates,
+                "value": 0.0,
+                "month": pad_dates.month,
+                "series_num": group["series_num"].iloc[0],
+                "mask": 0,
+            }))
+        padded = (
+            pd.concat([train] + pads, ignore_index=True)
+            .sort_values(["series_id", "date"])
+            .reset_index(drop=True)
+        )
+        model = self._make_model()
+        model.train(lgb_params=LGB_PARAMS_A, num_iterations=3, train_data=padded)
+        assert model.is_trained is True
+
+    def test_additive_accepts_non_positive_values(self):
+        """The additive variant exists precisely for zeros and negatives."""
+        train, _ = make_additive_panel(offset=-120.0)
+        assert (train["value"] <= 0).any()
+        model = make_additive_model()
+        result = model.train(
+            lgb_params=LGB_PARAMS_A, num_iterations=3, train_data=train
+        )
+        assert result.training_time is not None

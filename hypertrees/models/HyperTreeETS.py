@@ -1337,6 +1337,22 @@ class HyperTreeETS:
         if len(unique_lengths.unique()) > 1:
             raise ValueError("All series in train_data must have the same length. Found multiple lengths.")
 
+        # Multiplicative seasonality is undefined for non-positive values: the
+        # seasonal indices are ratios and the fit multiplies the level by the
+        # index. Fail fast instead of silently fitting meaningless components.
+        # Padded pseudo-observations (mask == 0) are exempt.
+        if self.ets_type == "triple":
+            values = train_data["value"]
+            if "mask" in train_data.columns:
+                values = values[train_data["mask"] == 1]
+            if (values <= 0).any():
+                raise ValueError(
+                    "ets_type='triple' fits multiplicative seasonality and "
+                    "requires strictly positive values; train_data contains "
+                    "zero or negative observations. Use ets_type='additive' "
+                    "for series with zeros or negative values."
+                )
+
         # General model parameters. The objective wrapper stops lgb.train's
         # params deepcopy from cloning this instance (see NoDeepcopyObjective).
         self.lgb_params = {
