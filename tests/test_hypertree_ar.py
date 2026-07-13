@@ -1436,3 +1436,21 @@ def test_category_dtype_features_roundtrip(assert_forecast_preserves_dataframe):
         train_data=train,
     )
     assert_forecast_preserves_dataframe(model, test)
+
+
+def test_zero_or_constant_features_raise_clear_error():
+    """Only series_id/date/value (or all-constant features) previously crashed
+    with an opaque LightGBM internal error; both must fail fast instead."""
+    dates = pd.date_range("2020-01-01", periods=40, freq="MS")
+    df = pd.DataFrame({
+        "series_id": "s0", "date": dates,
+        "value": 100 + np.arange(40, dtype=float),
+    })
+    model = HyperTreeAR(p=2, freq="M", fcst_h=3)
+    with pytest.raises(RuntimeError, match="No feature columns found"):
+        model.train(lgb_params={"learning_rate": 0.1}, num_iterations=5, train_data=df)
+    with pytest.raises(RuntimeError, match="All feature columns are constant"):
+        model.train(
+            lgb_params={"learning_rate": 0.1}, num_iterations=5,
+            train_data=df.assign(flag=1),
+        )

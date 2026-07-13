@@ -561,6 +561,23 @@ class _HyperTreeVARBase:
         feats = train_data[occ >= self.p].reset_index(drop=True)
         self.features = [c for c in feats.columns if c not in _RESERVED_COLUMNS]
 
+        # LightGBM needs at least one splittable feature; without one it fails
+        # deep inside training with an opaque internal error. Fail fast here.
+        if not self.features:
+            raise ValueError(
+                "No feature columns found: the data contains only the required "
+                "columns (series_id, date, value). Hyper-Trees learn the target "
+                "model's parameters as functions of features; add at least one "
+                "feature column (e.g., a calendar feature like month, or a "
+                "series-identity feature)."
+            )
+        if not any(feats[col].nunique(dropna=False) > 1 for col in self.features):
+            raise ValueError(
+                "All feature columns are constant. LightGBM cannot split on "
+                "constant features and drops them, leaving no usable inputs; "
+                "add at least one feature column whose values vary."
+            )
+
         n_avail = T - self.p
         if validation:
             if n_avail <= self.fcst_h:

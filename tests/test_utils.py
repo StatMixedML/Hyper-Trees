@@ -120,6 +120,7 @@ class TestTimeSeriesPreprocessor:
             'series_id': [1, 1, 1, 1, 1],
             'date': pd.date_range('2020-01-01', periods=5, freq='D'),
             'value': [10, 12, 14, 16, 18],
+            'feature1': [1, 2, 3, 4, 5],
         })
 
         result = processor.preprocess(input_df)
@@ -141,6 +142,7 @@ class TestTimeSeriesPreprocessor:
             'series_id': [1] * 5,
             'date': pd.date_range('2020-01-01', periods=5, freq='D'),
             'value': [10, 12, 14, 16, 18],
+            'feature1': [1, 2, 3, 4, 5],
         })
 
         result = processor.preprocess(input_df)
@@ -157,6 +159,7 @@ class TestTimeSeriesPreprocessor:
             'series_id': [1, 1, 1, 2, 2, 2],
             'date': list(pd.date_range('2020-01-01', periods=3, freq='D')) * 2,
             'value': [10, 20, 30, 100, 200, 300],
+            'feature1': [1, 2, 3, 4, 5, 6],
         })
 
         result = processor.preprocess(input_df)
@@ -211,10 +214,41 @@ class TestTimeSeriesPreprocessor:
             'series_id': [1] * 5,
             'date': pd.date_range('2020-01-01', periods=5, freq='D'),
             'value': [10, 12, 14, 16, 18],
-            'lagged_promo': [100] * 5,
+            'lagged_promo': [100, 110, 100, 120, 100],
         })
         result = processor.preprocess(input_df)
         assert 'lagged_promo' in result.columns
+
+    def test_preprocess_requires_at_least_one_feature(self):
+        """A frame with only the required columns must fail fast instead of
+        crashing opaquely inside LightGBM (which needs >= 1 feature)."""
+        processor = TimeSeriesPreprocessor(freq='D', lags=[1])
+        input_df = pd.DataFrame({
+            'series_id': [1] * 5,
+            'date': pd.date_range('2020-01-01', periods=5, freq='D'),
+            'value': [10, 12, 14, 16, 18],
+        })
+        with pytest.raises(ValueError, match="No feature columns found"):
+            processor.preprocess(input_df)
+
+    def test_preprocess_rejects_all_constant_features(self):
+        """LightGBM drops constant features internally; if none remain it dies
+        with an opaque fatal, so an all-constant feature set must fail fast."""
+        processor = TimeSeriesPreprocessor(freq='D', lags=[1])
+        input_df = pd.DataFrame({
+            'series_id': [1] * 5,
+            'date': pd.date_range('2020-01-01', periods=5, freq='D'),
+            'value': [10, 12, 14, 16, 18],
+            'feature1': [7.0] * 5,
+            'feature2': ['a'] * 5,
+        })
+        with pytest.raises(ValueError, match="All feature columns are constant"):
+            processor.preprocess(input_df)
+
+        # One varying feature among constants is sufficient
+        input_df['feature3'] = [1, 2, 3, 4, 5]
+        result = processor.preprocess(input_df)
+        assert 'feature3' in result.columns
 
     def test_extract_features(self):
         """Test feature extraction from a preprocessed DataFrame."""

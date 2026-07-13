@@ -242,6 +242,23 @@ class TimeSeriesPreprocessor:
                 f"column(s)."
             )
 
+        # LightGBM needs at least one splittable feature; without one it fails
+        # deep inside training with an opaque internal error. Fail fast here.
+        if not self.features:
+            raise ValueError(
+                "No feature columns found: the data contains only the required "
+                "columns (series_id, date, value). Hyper-Trees learn the target "
+                "model's parameters as functions of features; add at least one "
+                "feature column (e.g., a calendar feature like month, or a "
+                "series-identity feature)."
+            )
+        if not any(df[col].nunique(dropna=False) > 1 for col in self.features):
+            raise ValueError(
+                "All feature columns are constant. LightGBM cannot split on "
+                "constant features and drops them, leaving no usable inputs; "
+                "add at least one feature column whose values vary."
+            )
+
         # Ensure contiguous ordering per series for correct shift() behavior
         result_df = df[["series_id", "date", "value"] + self.features].sort_values(
             ["series_id", "date"]

@@ -502,6 +502,20 @@ class TestBaseValidation:
         with pytest.warns(UserWarning, match="consider HyperTreeAR instead"):
             model.train(lgb_params=LGB_PARAMS, num_iterations=5, train_data=train)
 
+    def test_zero_or_constant_features_raise_clear_error(self):
+        """Only series_id/date/value (or all-constant features) previously
+        crashed with an opaque LightGBM internal error; both must fail fast."""
+        train, _ = make_panel()
+        base = train[["series_id", "date", "value"]]
+        model = HyperTreeVAR(p=P, fcst_h=FCST_H)
+        with pytest.raises(RuntimeError, match="No feature columns found"):
+            model.train(lgb_params=LGB_PARAMS, num_iterations=5, train_data=base)
+        with pytest.raises(RuntimeError, match="All feature columns are constant"):
+            model.train(
+                lgb_params=LGB_PARAMS, num_iterations=5,
+                train_data=base.assign(flag=1),
+            )
+
     def test_series_shorter_than_lag_order_raises(self):
         train, _ = make_panel(n_train=P)
         model = HyperTreeVAR(p=P, fcst_h=FCST_H)
