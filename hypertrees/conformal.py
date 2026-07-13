@@ -1,4 +1,4 @@
-"""Conformal prediction intervals for Hyper-Tree models.
+"""Conformal forecast intervals for Hyper-Tree models.
 
 Acknowledgement
 ---------------
@@ -49,7 +49,7 @@ _VALID_METHODS = ("conformal_distribution", "conformal_error")
 
 @dataclass
 class ForecastIntervals:
-    """Configuration for conformal prediction intervals.
+    """Configuration for conformal forecast intervals.
 
     Parameters
     ----------

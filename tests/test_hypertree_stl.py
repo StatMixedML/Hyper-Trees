@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 from hypertrees.models.HyperTreeSTL import HyperTreeSTL
 from hypertrees.utils import TrainingResult
+from hypertrees import ForecastIntervals
 
 
 class TestHyperTreeSTLInitialization:
@@ -191,9 +192,9 @@ class TestHyperTreeSTLTraining:
     @patch("hypertrees.models.HyperTreeSTL.TimeSeriesPreprocessor")
     def test_successful_training(self, mock_preprocessor, mock_prepare_datasets, mock_lgb_train, sample_train_data):
         model = HyperTreeSTL(period=12, num_seasonal_components=1)
-        # The post-training seasonal-offset anchoring predicts with the model;
+        # The post-training forecast-state anchoring predicts with the model;
         # stub it out since lgb.train is mocked (no real booster to predict with).
-        model._compute_seasonal_offset = Mock(return_value=0.0)
+        model._anchor_forecast_state = Mock(return_value=None)
 
         # Mock preprocessor to return the same data and expose features incl. time_idx
         mock_pre = Mock()
@@ -714,3 +715,146 @@ class TestHyperTreeSTLCoreMethods:
         assert isinstance(hess, np.ndarray)
         assert grad.shape == (N * n_params,)
         assert hess.shape == (N * n_params,)
+
+
+class TestSTLForecastContinuation:
+    """Forecast-path fixes for the "default" variant: joint trend smoothing
+    with the training tail, cycle-aligned seasonal offset, floored Hessians,
+    the Gauss-Newton option, and conformal forecast intervals."""
+
+    def _series(self, n=96, fcst_h=12, slope=0.8, seed=0):
+        rng = np.random.RandomState(seed)
+        t = np.arange(1, n + fcst_h + 1)
+        dates = pd.date_range("2015-01-01", periods=n + fcst_h, freq="MS")
+        y = 50.0 + slope * t + 8.0 * np.sin(2 * np.pi * t / 12.0) + 0.3 * rng.randn(n + fcst_h)
+        df = pd.DataFrame({
+            "series_id": 0, "date": dates, "value": y,
+            "time": t, "month": dates.month,
+        })
+        test = df.tail(fcst_h).reset_index(drop=True)
+        train = df.head(n).reset_index(drop=True)
+
+        return train, test
+
+    def test_continuation_smoothing_preserves_linear_trend(self):
+        """Joint smoothing with the real training tail plus odd right
+        reflection reproduces a linear trend exactly over the horizon."""
+        model = HyperTreeSTL(period=12, num_seasonal_components=1, fcst_h=12, type="default")
+        model.n_series = 1
+        intercept, slope, t_train, h = 10.0, 0.5, 60, 12
+        t_fcst = torch.arange(t_train + 1, t_train + h + 1, dtype=torch.float32).view(-1, 1)
+        params = torch.zeros(h, 1, model.n_params)
+        params[:, :, 0] = intercept
+        params[:, :, 1] = slope
+        tail_len = (2 * model.period + 1) // 2
+        t_tail = torch.arange(t_train - tail_len + 1, t_train + 1, dtype=torch.float32).view(-1, 1)
+        trend_tail = intercept + slope * t_tail
+        trend, _ = model._forward_default(
+            params, t_fcst, seasonal_offset=torch.zeros(1),
+            trend_tail=trend_tail, w_eff=torch.tensor([20.0]),
+        )
+        torch.testing.assert_close(trend, intercept + slope * t_fcst, atol=1e-3, rtol=1e-5)
+
+    def test_isolated_window_smoothing_distorts_linear_trend(self):
+        """Contrast: without the tail, reflect padding folds the ramp and
+        flattens the slope (the artifact the continuation path removes)."""
+        model = HyperTreeSTL(period=12, num_seasonal_components=1, fcst_h=12, type="default")
+        model.n_series = 1
+        h = 12
+        t_fcst = torch.arange(61.0, 61.0 + h).view(-1, 1)
+        params = torch.zeros(h, 1, model.n_params)
+        params[:, :, 0] = 10.0
+        params[:, :, 1] = 0.5
+        trend, _ = model._forward_default(params, t_fcst, seasonal_offset=torch.zeros(1))
+        expected = 10.0 + 0.5 * t_fcst
+        assert (trend - expected).abs().max().item() > 0.3
+
+    def test_hessian_diagonal_floored_positive(self):
+        model = HyperTreeSTL(period=12, num_seasonal_components=1, type="default")
+        model.n_series = 1
+        n_obs = 48
+        time_idx = torch.arange(1.0, n_obs + 1).view(-1, 1)
+        for seed in range(3):
+            rng = np.random.RandomState(seed)
+            predt = rng.randn(n_obs * model.n_params)
+            target = torch.tensor(rng.randn(n_obs, 1), dtype=torch.float32) + 100.0
+            params, loss = model.get_params_loss(predt, target, time_idx, requires_grad=True)
+            _, hess = model._calculate_gradients_and_hessians(loss, params)
+            assert (hess > 0).all()
+
+    def test_seasonal_offset_aligned_to_training_cycles(self):
+        """T not a multiple of the period: the stored offset must equal the
+        constant training removed from the (reflect-extended) last cycle."""
+        m, n_obs = 12, 30  # 30 % 12 = 6 -> last cycle is 6 real + 6 reflected rows
+        model = HyperTreeSTL(period=m, num_seasonal_components=1, fcst_h=6, type="default")
+        model.n_series = 1
+        model.features = ["month", "time"]
+        # Constant parameters -> deterministic raw seasonal component
+        const_params = np.zeros((n_obs, model.n_params))
+        const_params[:, 3] = 1.0   # sine weight
+        const_params[:, 4] = 0.5   # cosine weight
+        booster = Mock()
+        booster.predict.return_value = const_params
+        model.model = booster
+
+        t = np.arange(1, n_obs + 1)
+        full_ts = pd.DataFrame({"month": (t - 1) % 12 + 1, "time": t})
+        model._anchor_forecast_state(full_ts)
+
+        # Independent reference: raw seasonal, reflect-extended, last-cycle mean
+        angle = t * (2 * np.pi / m)
+        s_raw = 1.0 * np.sin(angle) + 0.5 * np.cos(angle)
+        pad = m - (n_obs % m)
+        s_ext = np.concatenate([s_raw, s_raw[::-1][:pad]])
+        expected = s_ext[-m:].mean()
+        np.testing.assert_allclose(model._seasonal_offset.numpy(), [expected], atol=1e-5)
+
+    def test_gn_option_trains_and_validates(self):
+        with pytest.raises(ValueError, match="hessian_method must be either"):
+            HyperTreeSTL(hessian_method="analytic")
+        with pytest.raises(ValueError, match="n_hessian_probes"):
+            HyperTreeSTL(hessian_method="gn", n_hessian_probes=0)
+        with pytest.warns(UserWarning, match="not nn.MSELoss"):
+            HyperTreeSTL(hessian_method="gn", loss_fn=nn.SmoothL1Loss())
+
+        train, test = self._series()
+        model = HyperTreeSTL(period=12, num_seasonal_components=1, fcst_h=12,
+                             hessian_method="gn", type="default")
+        model.train(lgb_params={"learning_rate": 0.1}, num_iterations=10, train_data=train)
+        fcst = model.forecast(test_data=test)
+        assert np.isfinite(fcst["fcst"]).all()
+
+    @pytest.mark.parametrize("variant", ["default", "paper"])
+    def test_conformal_intervals(self, variant):
+        train, test = self._series()
+        model = HyperTreeSTL(period=12, num_seasonal_components=1, fcst_h=12, type=variant)
+        model.train(
+            lgb_params={"learning_rate": 0.1}, num_iterations=15, train_data=train,
+            forecast_intervals=ForecastIntervals(n_windows=3, refit=False),
+        )
+        assert model._is_calibrated is True
+        assert model._cs_scores.shape == (3, 1, 12)
+        fcst = model.forecast(test_data=test, level=[80])
+        lo, hi = "Hyper-Tree-STL(12)-lo-80", "Hyper-Tree-STL(12)-hi-80"
+        assert lo in fcst.columns and hi in fcst.columns
+        assert (fcst[lo] <= fcst["fcst"]).all()
+        assert (fcst["fcst"] <= fcst[hi]).all()
+
+    def test_level_validation(self):
+        train, test = self._series()
+        model = HyperTreeSTL(period=12, num_seasonal_components=1, fcst_h=12)
+        model.train(lgb_params={"learning_rate": 0.1}, num_iterations=5, train_data=train)
+        with pytest.raises(RuntimeError, match="not calibrated"):
+            model.forecast(test_data=test, level=[80])
+        with pytest.raises(ValueError, match="only supported with type='forecast'"):
+            model.forecast(test_data=test, type="parameters", level=[80])
+
+    def test_end_to_end_forecast_tracks_trend(self):
+        """The full fix stack: a trending seasonal series is forecast without
+        the edge flattening that used to bend the horizon."""
+        train, test = self._series(seed=3)
+        model = HyperTreeSTL(period=12, num_seasonal_components=1, fcst_h=12, type="default")
+        model.train(lgb_params={"learning_rate": 0.1}, num_iterations=150, train_data=train)
+        fcst = model.forecast(test_data=test)
+        mae = np.mean(np.abs(fcst["fcst"].to_numpy() - test["value"].to_numpy()))
+        assert mae < 3.0

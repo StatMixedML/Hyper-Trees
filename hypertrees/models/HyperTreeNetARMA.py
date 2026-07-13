@@ -294,7 +294,7 @@ class HyperTreeNetARMA:
         self._fit = None
         self._target = None
 
-        # Conformal prediction interval state (populated when train() is called
+        # Conformal forecast interval state (populated when train() is called
         # with forecast_intervals).
         self._is_calibrated = False
         self._cs_scores = None          # conformity scores (n_windows, n_series, fcst_h)
@@ -620,7 +620,7 @@ class HyperTreeNetARMA:
             reproducible results. May slow down training. See
             https://lightgbm.readthedocs.io/en/latest/Parameters.html#deterministic
         forecast_intervals : ForecastIntervals, optional
-            If provided, calibrate conformal prediction intervals via rolling-window
+            If provided, calibrate conformal forecast intervals via rolling-window
             cross-validation after the main model is trained. The collected conformity
             scores are then used by ``forecast(..., level=[...])`` to produce
             ``<model>-lo-<level>`` / ``<model>-hi-<level>`` columns. See
@@ -871,7 +871,7 @@ class HyperTreeNetARMA:
             # Set trained flag to True
             self.is_trained = True
 
-            # Calibrate conformal prediction intervals via rolling-window CV.
+            # Calibrate conformal forecast intervals via rolling-window CV.
             # Fresh model instances are trained per window (no forecast_intervals
             # passed, so there is no recursion) using the same hyper-parameters.
             if forecast_intervals is not None:
@@ -997,7 +997,7 @@ class HyperTreeNetARMA:
             - "tree_embeddings": Return the tree embeddings
         level : list of int, optional
             Confidence levels (in ``(0, 100)``, e.g. ``[80, 90]``) for conformal
-            prediction intervals. Only valid with ``type="forecast"`` and requires
+            forecast intervals. Only valid with ``type="forecast"`` and requires
             the model to have been trained with ``forecast_intervals=...``. Adds
             ``<model>-lo-<level>`` / ``<model>-hi-<level>`` columns to the output.
 
@@ -1011,7 +1011,7 @@ class HyperTreeNetARMA:
             - model: Model name identifier
             - AR(j) / MA(i): coefficient values (if type="parameters")
             - tree_embedding_{i}: GBDT tree-embedding dimensions (if type="tree_embeddings")
-            - <model>-lo-<level> / <model>-hi-<level>: prediction interval bounds
+            - <model>-lo-<level> / <model>-hi-<level>: forecast interval bounds
               (if type="forecast" and level is provided)
         """
         # Check if model is trained
@@ -1067,7 +1067,7 @@ class HyperTreeNetARMA:
                 raise ValueError("level is only supported with type='forecast'.")
             if not self._is_calibrated:
                 raise RuntimeError(
-                    "Prediction intervals were requested via level, but the model "
+                    "Forecast intervals were requested via level, but the model "
                     "was not calibrated. Pass forecast_intervals=ForecastIntervals(...) "
                     "to train() before forecasting with level."
                 )
@@ -1133,7 +1133,7 @@ class HyperTreeNetARMA:
                     "model": model_name,
                 })
 
-                # Append conformal prediction intervals if requested.
+                # Append conformal forecast intervals if requested.
                 if level is not None:
                     point = np.hstack(forecasts)  # (n_series_test, fcst_h)
                     columns = interval_columns(

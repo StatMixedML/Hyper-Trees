@@ -92,7 +92,7 @@ Hyper-Trees offer several advantages:
 | **`Hyper-Tree-TSB`** | Intermittent demand model (Teunter-Syntetos-Babai) with tree-learned, time-varying smoothing rates for demand probability and demand size. | ![](https://img.shields.io/badge/Global-blue) ![](https://img.shields.io/badge/Local-green) |
 
 `Global` means a single model is trained across multiple time series; `Local` means a separate model is trained for each individual series.
-All models produce point forecasts and support conformal prediction intervals via `ForecastIntervals` (see [Getting Started](#getting-started)). Full distributional (probabilistic) forecasting is planned for future releases. Note on `Hyper-Tree-STL`: it is designed to decompose time series into trend and seasonal components and is not intended for forecasting. However, the STL-parameters can still be used to generate forecasts.
+All models produce point forecasts and support conformal forecast intervals via `ForecastIntervals` (see [Getting Started](#getting-started)). Full distributional (probabilistic) forecasting is planned for future releases. Note on `Hyper-Tree-STL`: it is designed to decompose time series into trend and seasonal components and is not intended for forecasting. However, the STL-parameters can still be used to generate forecasts.
 
 ---
 
@@ -206,7 +206,7 @@ This work draws on and integrates methods and implementations from the following
 
 - [**<u>LightGBM</u>**](https://github.com/microsoft/LightGBM) – Gradient boosting framework for efficient tree-based learning.  
 - [**<u>PyTorch</u>**](https://github.com/pytorch/pytorch) – Deep learning framework for tensor computation and neural network modeling.  
-- [**<u>Nixtla</u>**](https://github.com/Nixtla) – Open Source Time Series Ecosystem. The conformal prediction intervals in `hypertrees/conformal.py` are adapted from Nixtla's [statsforecast](https://github.com/Nixtla/statsforecast), [mlforecast](https://github.com/Nixtla/mlforecast), and [neuralforecast](https://github.com/Nixtla/neuralforecast) (Apache-2.0); see [`THIRD_PARTY_NOTICES`](THIRD_PARTY_NOTICES).  
+- [**<u>Nixtla</u>**](https://github.com/Nixtla) – Open Source Time Series Ecosystem. The conformal forecast intervals in `hypertrees/conformal.py` are adapted from Nixtla's [statsforecast](https://github.com/Nixtla/statsforecast), [mlforecast](https://github.com/Nixtla/mlforecast), and [neuralforecast](https://github.com/Nixtla/neuralforecast) (Apache-2.0); see [`THIRD_PARTY_NOTICES`](THIRD_PARTY_NOTICES).  
 - [**<u>sktime</u>**](https://github.com/sktime/sktime) – A unified framework for machine learning with time series.
 - [**<u>GluonTS</u>**](https://github.com/awslabs/gluonts) – Probabilistic time series modeling and forecasting with deep learning.  
 

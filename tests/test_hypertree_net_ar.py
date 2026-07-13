@@ -1378,7 +1378,7 @@ class TestHyperTreeNetARObjectiveFunction:
 
 
 class TestHyperTreeNetARConformal:
-    """Tests for conformal prediction intervals on HyperTreeNetAR."""
+    """Tests for conformal forecast intervals on HyperTreeNetAR."""
 
     FCST_H = 4
     N_SERIES = 2

@@ -570,7 +570,7 @@ def coverage(
     model: str,
     value_col: str = "value",
 ) -> float:
-    r"""Empirical coverage of a conformal prediction interval.
+    r"""Empirical coverage of a conformal forecast interval.
 
     Computes the fraction of realized values that fall within the
     ``[<model>-lo-<level>, <model>-hi-<level>]`` band, reported in percent.
@@ -611,7 +611,7 @@ def mean_interval_width(
     level: int,
     model: str,
 ) -> float:
-    """Mean width of a conformal prediction interval.
+    """Mean width of a conformal forecast interval.
 
     Parameters
     ----------

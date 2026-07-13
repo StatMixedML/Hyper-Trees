@@ -16,7 +16,7 @@ Because all k equations share the same regressors, minimizing a
 per-observation loss equation-by-equation is equivalent to the joint
 (GLS/SUR) estimate in the classical linear case (Zellner, 1962), so nothing
 is lost by training with the standard element-wise losses used across the
-Hyper-Tree models. Conformal prediction intervals are supported exactly as
+Hyper-Tree models. Conformal forecast intervals are supported exactly as
 for the other models (per-series, per-horizon-step marginal intervals).
 
 The two concrete models live in their own modules, mirroring the repo's
@@ -247,7 +247,7 @@ class _HyperTreeVARBase:
             breaks Newton boosting).
         scaling : str, optional
             Per-series scaling applied internally before training; forecasts
-            (and prediction intervals) are transformed back to the original
+            (and forecast intervals) are transformed back to the original
             scale automatically. Options:
             - "mean" (default): divide each series by its mean absolute
               training value. Location-free, so it introduces no implicit
@@ -320,7 +320,7 @@ class _HyperTreeVARBase:
         self._scale_scale = None        # (k,) per-series scale (training order)
         self._iter_count = 0
 
-        # Conformal prediction interval state (populated when train() is
+        # Conformal forecast interval state (populated when train() is
         # called with forecast_intervals).
         self._is_calibrated = False
         self._cs_scores = None          # conformity scores (n_windows, n_series, fcst_h)
@@ -686,7 +686,7 @@ class _HyperTreeVARBase:
         Validates the inputs, builds the panel datasets, runs the
         model-specific post-dataset setup (:meth:`_post_datasets_setup`),
         trains LightGBM with the subclass objective, and optionally
-        calibrates conformal prediction intervals.
+        calibrates conformal forecast intervals.
 
         Parameters
         ----------
@@ -759,7 +759,7 @@ class _HyperTreeVARBase:
             training_time = time.time() - start_time
             self.is_trained = True
 
-            # Calibrate conformal prediction intervals via rolling-window CV.
+            # Calibrate conformal forecast intervals via rolling-window CV.
             # Fresh model instances are trained per window (no forecast_intervals
             # passed, so there is no recursion) using the same hyper-parameters.
             if forecast_intervals is not None:
@@ -919,7 +919,7 @@ class _HyperTreeVARBase:
                 raise ValueError("level is only supported with type='forecast'.")
             if not self._is_calibrated:
                 raise RuntimeError(
-                    "Prediction intervals were requested via level, but the model "
+                    "Forecast intervals were requested via level, but the model "
                     "was not calibrated. Pass forecast_intervals=ForecastIntervals(...) "
                     "to train() before forecasting with level."
                 )
@@ -1066,7 +1066,7 @@ class _HyperTreeVARBase:
             - "tree_embeddings": Return the tree embeddings (HyperTreeNetVAR only)
         level : list of int, optional
             Confidence levels (in ``(0, 100)``, e.g. ``[80, 90]``) for conformal
-            prediction intervals. Only valid with ``type="forecast"`` and requires
+            forecast intervals. Only valid with ``type="forecast"`` and requires
             the model to have been trained with ``forecast_intervals=...``. Adds
             ``<model>-lo-<level>`` / ``<model>-hi-<level>`` columns to the output.
 
@@ -1079,7 +1079,7 @@ class _HyperTreeVARBase:
             - fcst: Forecasted value (if type="forecast")
             - model: Model name identifier
             - A{j}({series_id}): VAR coefficient values (if type="parameters")
-            - <model>-lo-<level> / <model>-hi-<level>: prediction interval bounds
+            - <model>-lo-<level> / <model>-hi-<level>: forecast interval bounds
               (if type="forecast" and level is provided)
         """
         self._validate_forecast_args(test_data, type, level)
@@ -1130,7 +1130,7 @@ class _HyperTreeVARBase:
                     "model": model_name,
                 })
 
-                # Append conformal prediction intervals if requested.
+                # Append conformal forecast intervals if requested.
                 if level is not None:
                     columns = interval_columns(
                         point=point,

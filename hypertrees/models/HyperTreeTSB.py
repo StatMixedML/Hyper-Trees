@@ -185,7 +185,7 @@ class HyperTreeTSB:
         # Shared Gauss-Newton Hessian estimator
         self._gn_hessian = GaussNewtonHessian(loss_fn, n_hessian_probes, self.dtype)
 
-        # Conformal prediction interval state
+        # Conformal forecast interval state
         self._is_calibrated = False
         self._cs_scores = None
         self._cs_series_order = None
@@ -631,7 +631,7 @@ class HyperTreeTSB:
             reproducible results. May slow down training. See
             https://lightgbm.readthedocs.io/en/latest/Parameters.html#deterministic
         forecast_intervals : ForecastIntervals, optional
-            If provided, calibrate conformal prediction intervals via rolling-window
+            If provided, calibrate conformal forecast intervals via rolling-window
             cross-validation after the main model is trained. The collected conformity
             scores are then used by ``forecast(..., level=[...])`` to produce
             ``<model>-lo-<level>`` / ``<model>-hi-<level>`` columns. See
@@ -941,7 +941,7 @@ class HyperTreeTSB:
             - "parameters": Return the TSB smoothing parameters
         level : list of int, optional
             Confidence levels (in ``(0, 100)``, e.g. ``[80, 90]``) for conformal
-            prediction intervals. Only valid with ``type="forecast"`` and requires
+            forecast intervals. Only valid with ``type="forecast"`` and requires
             the model to have been trained with ``forecast_intervals=...``. Adds
             ``<model>-lo-<level>`` / ``<model>-hi-<level>`` columns to the output.
 
@@ -954,7 +954,7 @@ class HyperTreeTSB:
             - fcst: Forecasted value (if type="forecast")
             - model: Model name identifier
             - alpha_p, alpha_d: TSB parameter values (if type="parameters")
-            - <model>-lo-<level> / <model>-hi-<level>: prediction interval bounds
+            - <model>-lo-<level> / <model>-hi-<level>: forecast interval bounds
               (if type="forecast" and level is provided)
         """
         # Check if model is trained and states are stored
@@ -1006,7 +1006,7 @@ class HyperTreeTSB:
                 raise ValueError("level is only supported with type='forecast'.")
             if not self._is_calibrated:
                 raise RuntimeError(
-                    "Prediction intervals were requested via level, but the model "
+                    "Forecast intervals were requested via level, but the model "
                     "was not calibrated. Pass forecast_intervals=ForecastIntervals(...) "
                     "to train() before forecasting with level."
                 )

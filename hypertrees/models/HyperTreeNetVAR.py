@@ -172,7 +172,7 @@ class HyperTreeNetVAR(_HyperTreeVARBase):
             breaks Newton boosting).
         scaling : str, optional
             Per-series scaling applied internally before training; forecasts
-            (and prediction intervals) are transformed back to the original
+            (and forecast intervals) are transformed back to the original
             scale automatically. Options: "mean" (default; divide by the
             mean absolute training value), "standard" (z-score), or None.
             Strongly recommended for heterogeneous panels: VAR coefficients
@@ -530,7 +530,7 @@ class HyperTreeNetVAR(_HyperTreeVARBase):
             parameters to ensure reproducible results. May slow down training.
             See https://lightgbm.readthedocs.io/en/latest/Parameters.html#deterministic
         forecast_intervals : ForecastIntervals, optional
-            If provided, calibrate conformal prediction intervals via
+            If provided, calibrate conformal forecast intervals via
             rolling-window cross-validation after the main model is trained.
             The collected conformity scores are then used by
             ``forecast(..., level=[...])`` to produce ``<model>-lo-<level>`` /

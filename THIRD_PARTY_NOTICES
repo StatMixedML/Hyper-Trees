@@ -18,7 +18,7 @@ libraries, each licensed under the Apache License, Version 2.0:
 The following components are adapted from these libraries and have been
 modified from the originals:
 
-  - Conformal prediction intervals (hypertrees/conformal.py): the
+  - Conformal forecast intervals (hypertrees/conformal.py): the
     rolling-origin calibration, the two interval-construction methods
     ("conformal_distribution" and "conformal_error"), the per-horizon-step
     quantile logic, and the "<model>-lo-<level>" / "<model>-hi-<level>"

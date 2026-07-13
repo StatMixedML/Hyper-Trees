@@ -1213,7 +1213,7 @@ class TestHyperTreeAREvalFunction:
 
 
 class TestHyperTreeARConformal:
-    """Tests for conformal prediction intervals on HyperTreeAR."""
+    """Tests for conformal forecast intervals on HyperTreeAR."""
 
     P = 2
     FCST_H = 4

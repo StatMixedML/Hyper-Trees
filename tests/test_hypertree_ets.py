@@ -825,7 +825,7 @@ class TestHyperTreeETSStoreFinalStates:
 
 
 class TestHyperTreeETSConformal:
-    """Tests for conformal prediction intervals on HyperTreeETS."""
+    """Tests for conformal forecast intervals on HyperTreeETS."""
 
     FCST_H = 4
     N_SERIES = 2
