@@ -71,7 +71,7 @@ Hyper-Trees offer several advantages:
 ---
 
 # News
-[2026-07-13] v0.2.0 adds support for forecast intervals via conformal prediction and also adds multiple new models.<br>
+[2026-07-14] v0.2.0 adds support for forecast intervals via conformal prediction and also adds multiple new models.<br>
 [2026-06-01] v0.1.0 released on [PyPI](https://pypi.org/project/hypertrees-forecasting/).<br>
 [2024-05-01] Create repository and initial commits.
 
