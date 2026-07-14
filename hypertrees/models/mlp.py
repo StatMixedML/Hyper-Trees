@@ -14,6 +14,15 @@ class RPLayer(nn.Module):
 
     In Proceedings of the 30th ACM SIGKDD Conference on Knowledge Discovery and Data Mining (KDD '24).
     Association for Computing Machinery, New York, NY, USA, 3919–3930. https://doi.org/10.1145/3637528.3671881
+
+    Parameters
+    ----------
+    in_dim : int
+        Dimension of the input (the tree embeddings).
+    out_dim : int
+        Output dimension of the random projection.
+    seed : int
+        Random seed used to draw the fixed (non-trainable) projection weights.
     """
 
     def __init__(self, in_dim: int, out_dim: int, seed: int):
@@ -70,6 +79,10 @@ class MLP(nn.Module):
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, output_dim),
+            # Dropout deliberately sits after the output layer, as specified
+            # in the paper (Section 2.2, footnote on the MLP architecture):
+            # it randomly zeros individual target-model coefficients during
+            # training, acting as parameter regularization.
             nn.Dropout(dropout_rate)
         ])
 

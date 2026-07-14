@@ -6,12 +6,15 @@ This folder is the reproducibility section for the paper. It contains all data, 
 
 ## Installation
 
-First, clone the repository:
+First, clone the repository and check out the paper-reproduction tag:
 
 ```bash
 git clone https://github.com/StatMixedML/Hyper-Trees.git
 cd Hyper-Trees
+git checkout paper-repro
 ```
+
+> ⚠️ Paper reproduction is anchored to the **`paper-repro`** git tag, which marks the exact code state that produced the published results. The `main` branch continues to evolve (new models, changed defaults) and is not guaranteed to reproduce the paper numbers. Always use the tag together with the pinned environment below; both are required for reproducibility.
 
 We use [`uv`](https://docs.astral.sh/uv/) as the package manager. Install it first if you don't already have it:
 

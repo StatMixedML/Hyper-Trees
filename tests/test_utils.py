@@ -120,6 +120,7 @@ class TestTimeSeriesPreprocessor:
             'series_id': [1, 1, 1, 1, 1],
             'date': pd.date_range('2020-01-01', periods=5, freq='D'),
             'value': [10, 12, 14, 16, 18],
+            'feature1': [1, 2, 3, 4, 5],
         })
 
         result = processor.preprocess(input_df)
@@ -141,6 +142,7 @@ class TestTimeSeriesPreprocessor:
             'series_id': [1] * 5,
             'date': pd.date_range('2020-01-01', periods=5, freq='D'),
             'value': [10, 12, 14, 16, 18],
+            'feature1': [1, 2, 3, 4, 5],
         })
 
         result = processor.preprocess(input_df)
@@ -157,6 +159,7 @@ class TestTimeSeriesPreprocessor:
             'series_id': [1, 1, 1, 2, 2, 2],
             'date': list(pd.date_range('2020-01-01', periods=3, freq='D')) * 2,
             'value': [10, 20, 30, 100, 200, 300],
+            'feature1': [1, 2, 3, 4, 5, 6],
         })
 
         result = processor.preprocess(input_df)
@@ -188,6 +191,64 @@ class TestTimeSeriesPreprocessor:
         assert 'feature2' in result.columns
         # Features detected and stored on the processor
         assert sorted(processor.features) == ['feature1', 'feature2']
+
+    def test_preprocess_rejects_reserved_lag_feature_names(self):
+        """Feature columns named lag<number> are reserved for the generated
+        AR lags: a name inside the lag range would be silently overwritten
+        (and the surviving column order permuted), one outside the range
+        would be mis-collected into the lag tensor by extract()."""
+        processor = TimeSeriesPreprocessor(freq='D', lags=[1, 2, 3])
+
+        for reserved_name in ['lag2', 'lag5']:
+            input_df = pd.DataFrame({
+                'series_id': [1] * 5,
+                'date': pd.date_range('2020-01-01', periods=5, freq='D'),
+                'value': [10, 12, 14, 16, 18],
+                reserved_name: [100] * 5,
+            })
+            with pytest.raises(ValueError, match="reserved"):
+                processor.preprocess(input_df)
+
+        # Names that merely start with 'lag' but are not lag<number> are fine
+        input_df = pd.DataFrame({
+            'series_id': [1] * 5,
+            'date': pd.date_range('2020-01-01', periods=5, freq='D'),
+            'value': [10, 12, 14, 16, 18],
+            'lagged_promo': [100, 110, 100, 120, 100],
+        })
+        result = processor.preprocess(input_df)
+        assert 'lagged_promo' in result.columns
+
+    def test_preprocess_requires_at_least_one_feature(self):
+        """A frame with only the required columns must fail fast instead of
+        crashing opaquely inside LightGBM (which needs >= 1 feature)."""
+        processor = TimeSeriesPreprocessor(freq='D', lags=[1])
+        input_df = pd.DataFrame({
+            'series_id': [1] * 5,
+            'date': pd.date_range('2020-01-01', periods=5, freq='D'),
+            'value': [10, 12, 14, 16, 18],
+        })
+        with pytest.raises(ValueError, match="No feature columns found"):
+            processor.preprocess(input_df)
+
+    def test_preprocess_rejects_all_constant_features(self):
+        """LightGBM drops constant features internally; if none remain it dies
+        with an opaque fatal, so an all-constant feature set must fail fast."""
+        processor = TimeSeriesPreprocessor(freq='D', lags=[1])
+        input_df = pd.DataFrame({
+            'series_id': [1] * 5,
+            'date': pd.date_range('2020-01-01', periods=5, freq='D'),
+            'value': [10, 12, 14, 16, 18],
+            'feature1': [7.0] * 5,
+            'feature2': ['a'] * 5,
+        })
+        with pytest.raises(ValueError, match="All feature columns are constant"):
+            processor.preprocess(input_df)
+
+        # One varying feature among constants is sufficient
+        input_df['feature3'] = [1, 2, 3, 4, 5]
+        result = processor.preprocess(input_df)
+        assert 'feature3' in result.columns
 
     def test_extract_features(self):
         """Test feature extraction from a preprocessed DataFrame."""
@@ -380,6 +441,20 @@ class TestValidateSeriesOrder:
         data = pd.DataFrame({
             'series_id': [0, 0, 0],
             'date': pd.to_datetime(['2020-01-03', '2020-01-01', '2020-01-02']),
+            'value': [1, 2, 3]
+        })
+        with pytest.raises(ValueError, match="not strictly increasing"):
+            validate_series_order(data)
+
+    def test_duplicate_dates(self):
+        """Duplicate dates within a series must be rejected (strictness).
+
+        ``is_monotonic_increasing`` alone is non-strict and would let
+        duplicates through, corrupting lag construction and reshapes.
+        """
+        data = pd.DataFrame({
+            'series_id': [0, 0, 0],
+            'date': pd.to_datetime(['2020-01-01', '2020-01-01', '2020-01-02']),
             'value': [1, 2, 3]
         })
         with pytest.raises(ValueError, match="not strictly increasing"):
