@@ -824,6 +824,22 @@ class TestSTLForecastContinuation:
         fcst = model.forecast(test_data=test)
         assert np.isfinite(fcst["fcst"]).all()
 
+    @pytest.mark.parametrize("fcst_h", [3, 1])
+    def test_short_horizon_end_to_end_forecast_no_crash(self, fcst_h):
+        """Short horizons should train and forecast finite values."""
+        train, test = self._series(n=48, fcst_h=fcst_h, seed=fcst_h)
+        model = HyperTreeSTL(period=12, num_seasonal_components=1, fcst_h=fcst_h, type="default")
+
+        model.train(
+            lgb_params={"learning_rate": 0.1, "num_leaves": 4, "min_data_in_leaf": 1},
+            num_iterations=5,
+            train_data=train,
+        )
+        fcst = model.forecast(test_data=test)
+
+        assert len(fcst) == fcst_h
+        assert np.isfinite(fcst["fcst"]).all()
+
     @pytest.mark.parametrize("variant", ["default", "paper"])
     def test_conformal_intervals(self, variant):
         train, test = self._series()
