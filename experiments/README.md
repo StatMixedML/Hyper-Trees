@@ -66,7 +66,7 @@ All experiments in the paper were conducted with the following specifications:
 - **OS:** Windows 11
 - **CPU:** 13th Gen Intel(R) Core(TM) i9-13900H (14 cores)
 - **RAM:** 64 GB
-- **GPU:** NVIDIA RTX 3500 Ada Generation Laptop GPU (12 GB memory)
+- **GPU:** NVIDIA RTX 3500 Ada Generation Laptop GPU (12 GB)
 
 ## Running Experiments
 
@@ -198,6 +198,10 @@ All datasets used in this paper are publicly available and are included directly
 - `AutoARIMA` / `AutoARIMA-X` (local only): ARIMA with automatic `(p,d,q)` selection; the `-X` variant adds features.
 - `AR(p)` / `AR(p)-X` (local only): fixed-order `ARIMA(p, 0, 0)`; the `-X` variant adds features.
 - `AutoETS` (local only): Automatic Exponential Smoothing (used as MASE reference).
+
+
+## Note on Reproducibility
+The numerical results presented in the accompanying paper were reproduced by the reproducibility team on September 8, 2026, with some discrepancies. The local models reproduce exactly on all reported metrics and datasets, apart from the AR and ARIMA baselines, as do the figures derived from the tree structure and one entire global row on every error metric. The discrepancies observed in the remaining global results follow the characteristic pattern of floating-point accumulation: the order in which compiled numerical code combines floating-point values is not fixed across machines, and the effect scales with the amount of data in each fit. This can occur even between installations with identical package versions. No ranking or conclusion in the paper is affected. A detailed explanation, with supporting documentation from the LightGBM, Intel MKL, NumPy, and PyTorch projects, is provided in `experiments/Reproducibility Note.pdf`.
 
 ## Contact
 
