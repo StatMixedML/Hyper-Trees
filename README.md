@@ -235,7 +235,12 @@ If you use `Hyper-Trees` in your research, please cite our paper:
 
 ---
 
-## History
-<a href="https://star-history.com/#StatMixedML/Hyper-Trees&Date">
-    <img src="https://star-history.dera.page/svg?repos=StatMixedML/Hyper-Trees&type=Date" width="450">
+## Star History
+
+<a href="https://www.star-history.com/?repos=StatMixedML%2FHyper-Trees&type=date&logscale=&legend=bottom-right">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=StatMixedML/Hyper-Trees&type=date&theme=dark&legend=bottom-right" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=StatMixedML/Hyper-Trees&type=date&legend=bottom-right" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=StatMixedML/Hyper-Trees&type=date&legend=bottom-right" />
+ </picture>
 </a>
